@@ -1,0 +1,21 @@
+target/
+keys/
+*.pem
+*.key
+*.env
+.env
+node-data/
+chunks/
+kv.json
+dht.json
+mail.key
+tools/bin/
+logs/
+*.log
+node_modules/
+
+# --- open-source hardening (OS1): never publish secrets or local state ---
+env.*
+*handoff*
+*helper*keys*
+.opencode/

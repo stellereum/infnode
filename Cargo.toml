@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/infnode"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+axum = "0.8"
+base64 = "0.22"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "zeroize"] }
+hex = "0.4"
+hmac = "0.12"
+imap = { version = "2.4", default-features = false, features = ["tls"] }
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "ring", "webpki-roots", "tokio1"] }
+pkcs8 = "0.10"
+png = "0.17"
+quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+rand = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+xsalsa20poly1305 = "0.9"
+aead = "0.5"
+time = { version = "0.3", features = ["std"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x509-parser = { version = "0.16", features = ["verify"] }
+zeroize = { version = "1", features = ["derive"] }
