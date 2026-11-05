@@ -18,7 +18,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, RateBucket};
 use infnode::proto::{self, Frame, NODEID_LEN};
 use std::net::SocketAddr;
@@ -163,12 +163,19 @@ fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts
 fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
     let eph = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
     let eph_pub = x25519_dalek::PublicKey::from(&eph);
+    // FULL-PQ: CHALLENGE carries ephemeral ML-KEM `pq_ek` (KEM-only session,
+    // X3DH leg cut — sibling). Without `pq_*` the responder fails closed
+    // (`pq handshake required`). Same construction as production
+    // `connect_with_auth` (reuse `pq_initiator_offer`, no new crypto).
+    let offer = infnode::node::pq_initiator_offer().expect("pq offer");
     serde_json::json!({
         "nonce": nonce_hex,
         "at": at,
         "eph": hex::encode(eph_pub.as_bytes()),
         "ed": hex::encode(keys.verifying.to_bytes()),
-        "x": hex::encode(keys.e2e_pub.as_bytes()),
+        "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
+        "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&offer.ek),
     })
     .to_string()
 }
@@ -199,9 +206,10 @@ async fn harden_strikes_reset_on_success() {
     harden_env();
     let tmp = tmpdir("strikes-pure");
     let keys = NodeKeys::generate();
+    let pq = PqKeys::generate();
     let node = Node::new(
         cfg("S", "127.0.0.1:0", vec![], false),
-        keys,
+        keys, pq,
         tmp.join("s"),
         PathBuf::new(),
     )
@@ -236,9 +244,10 @@ async fn harden_slow_handshake_rain_deadline_closes() {
     let tmp = tmpdir("slow-rain");
     let listen: SocketAddr = "127.0.0.1:19911".parse().unwrap();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19911", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -310,9 +319,10 @@ async fn harden_burst_dials_throttled() {
     let tmp = tmpdir("burst");
     let listen: SocketAddr = "127.0.0.1:19912".parse().unwrap();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19912", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -364,9 +374,10 @@ async fn harden_strikes_cooldown_recovery() {
     let tmp = tmpdir("strikes-net");
     let listen: SocketAddr = "127.0.0.1:19913".parse().unwrap();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19913", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -453,9 +464,10 @@ async fn harden_legit_handshake_unaffected() {
     let tmp = tmpdir("legit");
     let listen: SocketAddr = "127.0.0.1:19914".parse().unwrap();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19914", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )

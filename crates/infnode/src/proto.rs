@@ -105,54 +105,19 @@ pub fn svc_name(id: u64) -> Option<&'static str> {
         .copied()
 }
 
-/// E2E ключ: X25519(shared) + оба NodeID (канонически отсортированы), раздутый через blake3.
-/// Симметричный для обеих сторон независимо от направления.
-pub fn e2e_key_from_shared(shared: &[u8; 32], id_a: &[u8; 20], id_b: &[u8; 20]) -> [u8; 32] {
-    let (lo, hi) = if id_a < id_b {
-        (id_a, id_b)
-    } else {
-        (id_b, id_a)
-    };
+/// KEM-only session key: `blake3(PQ_SESSION_DOMAIN || pq_shared || digest)`.
+///
+/// FULL-PQ: the classical X3DH leg is cut — no static/ephemeral ECDH input.
+/// Forward secrecy comes from the fresh ephemeral ML-KEM-768 encap per
+/// handshake; the transcript `digest` binds the session (KEX ek/ct + frame
+/// bindings, including the exchanged eph pubs as freshness). Either input
+/// flipping changes the output.
+pub fn pq_session_key(pq_shared: &[u8; 32], digest: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"infnode-e2e-v1");
-    h.update(shared);
-    h.update(lo);
-    h.update(hi);
-    let out = h.finalize();
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&out.as_bytes()[..32]);
-    k
-}
-
-/// Сессионный ключ с forward secrecy (X3DH-подобный): смешиваем 4 shared-секрета —
-/// ss(static-static), se(static-эфимерный), es(эфемерный-static), ee(эфемерный-эфемерный).
-/// Каждое соединение использует свежие эфемерные ключи, поэтому компрометация
-/// долгосрочных ключей позже не раскрывает прошлый трафик.
-pub fn session_key(
-    shared_ss: &[u8; 32],
-    shared_se: &[u8; 32],
-    shared_es: &[u8; 32],
-    shared_ee: &[u8; 32],
-    id_a: &[u8; 20],
-    id_b: &[u8; 20],
-) -> [u8; 32] {
-    let (lo, hi) = if id_a < id_b {
-        (id_a, id_b)
-    } else {
-        (id_b, id_a)
-    };
-    let mut h = blake3::Hasher::new();
-    h.update(b"infnode-session-v1");
-    h.update(shared_ss);
-    h.update(shared_se);
-    h.update(shared_es);
-    h.update(shared_ee);
-    h.update(lo);
-    h.update(hi);
-    let out = h.finalize();
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&out.as_bytes()[..32]);
-    k
+    h.update(PQ_SESSION_DOMAIN);
+    h.update(pq_shared);
+    h.update(digest);
+    *h.finalize().as_bytes()
 }
 
 #[derive(Clone, Debug)]
@@ -484,21 +449,6 @@ pub fn pq_verify_tag(expected: &[u8; 32], got: &[u8; 32]) -> bool {
     d == 0
 }
 
-/// Hybrid session key: breaks only if BOTH the classical X3DH key and the
-/// ML-KEM shared secret break. Either input flipping changes the output.
-pub fn pq_hybrid_session_key(
-    classical: &[u8; 32],
-    pq_shared: &[u8; 32],
-    digest: &[u8; 32],
-) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(PQ_SESSION_DOMAIN);
-    h.update(classical);
-    h.update(pq_shared);
-    h.update(digest);
-    *h.finalize().as_bytes()
-}
-
 /// Negotiated handshake mode after applying the mixed-mode window policy.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PqMode {
@@ -737,28 +687,26 @@ pub fn pq_falcon_policy_at(
     Ok(PqMode::Pq)
 }
 
-// TRANSPORT-KEX FULL: AEAD frame bodies under the established hybrid
-// session key when PQ is negotiated. Additive only: no existing function,
-// layout, or domain above is modified, so classical sessions stay
-// byte-identical (they never call these helpers; the classical wire path is
-// `Frame::{encode,decode,verify}` + `session_key`/`e2e_key_from_shared`,
-// pinned by existing KATs).
+// TRANSPORT-KEX FULL: AEAD frame bodies under the established KEM-only
+// session key when PQ is negotiated (`pq_session_key(pq_shared, digest)`;
+// the classical X3DH leg is cut — no hybrid derivation anymore). No
+// existing layout or domain above is modified, so the classical wire path
+// (`Frame::{encode,decode,verify}`, pinned by existing KATs) is untouched.
 //
-// Key: `pq_hybrid_session_key(classical, pq_shared, digest)` — same
-// derivation and transcript shapes as the handshake (`PqTranscript::digest`
-// with `PQ_SUITE_MLKEM768_HYBRID`). Cipher: XChaCha20-Poly1305, same idiom
-// as `mailbox::seal`/`node::e2e_encrypt_det` (no new deps). Classical e2e
-// uses empty AAD; PQ frames bind a canonical AAD
-// (`KEX_FRAME_DOMAIN || header || session digest`) so a body sealed in one
-// session never opens in another (key differs AND aad differs — both layers
-// fail closed).
+// Key: `pq_session_key(pq_shared, digest)` — same transcript shapes as the
+// handshake (`PqTranscript::digest` with `PQ_SUITE_MLKEM768_HYBRID`). Cipher:
+// XChaCha20-Poly1305, same idiom as `mailbox::seal`/`node::e2e_encrypt_det`
+// (no new deps). Classical e2e uses empty AAD; PQ frames bind a canonical
+// AAD (`KEX_FRAME_DOMAIN || header || session digest`) so a body sealed in
+// one session never opens in another (key differs AND aad differs — both
+// layers fail closed).
 //
 // Key rotation / epoch: the session key is fixed for the lifetime of one
 // connection (`sessions: stable_id -> [u8;32]` in `node.rs`, read-only here).
 // There is no mid-connection re-key in scope; re-key = reconnect (fresh
-// ephemeral X25519 + fresh ML-KEM encap => fresh hybrid key). Wiring these
-// helpers into `node.rs frame_loop` is the sibling's zone; this module only
-// provides the fail-closed seal/open primitives + tests.
+// ML-KEM encap => fresh KEM-only key). Wiring these helpers into
+// `node.rs frame_loop` is the sibling's zone; this module only provides the
+// fail-closed seal/open primitives + tests.
 //
 /// Domain separating PQ frame AAD from classical e2e (which uses empty AAD).
 pub const KEX_FRAME_DOMAIN: &[u8] = b"infnode-frame-v1";
@@ -792,8 +740,8 @@ pub fn kex_frame_aad(
     v
 }
 
-/// Seal a frame body under `session_key` (== `pq_hybrid_session_key(...)`
-/// when PQ negotiated) with the given 24-byte nonce and AAD from
+/// Seal a frame body under `session_key` (== `pq_session_key(...)` when PQ
+/// negotiated) with the given 24-byte nonce and AAD from
 /// [`kex_frame_aad`]. Deterministic for fixed inputs (fixtures/KATs); use
 /// [`kex_frame_seal_rand`] for live traffic.
 pub fn kex_frame_seal(

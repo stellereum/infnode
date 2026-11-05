@@ -20,7 +20,7 @@
 //! BOTH directions — especially from the node that dialed.
 
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,13 +48,13 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>) -> NodeConfig {
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        // FULL-PQ: identity is PQ-only (`primary_id` derives the PQ id
+        // from the pinned `pq_pub` — existing helper, no new logic).
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -101,20 +101,28 @@ async fn pubsub_delivers_in_both_directions() {
     let listen_b = "127.0.0.1:19411";
 
     // Both identities first, so each config can pin the other.
+    // FULL-PQ: PQ identities pin each other (`pq_pub`); NodeIds are PQ-only
+    // via `ceremony_local_id` (same construction as `PeerConfig::primary_id`).
     let keys_a = NodeKeys::generate();
     let keys_b = NodeKeys::generate();
+    let pq_a = PqKeys::generate();
+    let pq_b = PqKeys::generate();
+    let id_a = infnode::node::ceremony_local_id(&keys_a, &pq_a);
+    let id_b = infnode::node::ceremony_local_id(&keys_b, &pq_b);
 
     let node_a = Node::new(
-        cfg("A", listen_a, vec![peer_of("B", &keys_b, listen_b)]),
+        cfg("A", listen_a, vec![peer_of("B", &keys_b, &pq_b, listen_b)]),
         keys_a.clone(),
+        pq_a.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let node_b = Node::new(
-        cfg("B", listen_b, vec![peer_of("A", &keys_a, listen_a)]),
+        cfg("B", listen_b, vec![peer_of("A", &keys_a, &pq_a, listen_a)]),
         keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -136,8 +144,8 @@ async fn pubsub_delivers_in_both_directions() {
 
     // B is the one that will dial A below; this is the connection that used to
     // have no receive loop on B's side.
-    subscribe_at_peer(&node_b, keys_a.id(), topic).await;
-    subscribe_at_peer(&node_a, keys_b.id(), topic).await;
+    subscribe_at_peer(&node_b, id_a, topic).await;
+    subscribe_at_peer(&node_a, id_b, topic).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // A -> B
@@ -145,7 +153,7 @@ async fn pubsub_delivers_in_both_directions() {
         .to_string()
         .into_bytes();
     node_a
-        .request_to(keys_b.id(), "pubsub.msg", p)
+        .request_to(id_b, "pubsub.msg", p)
         .await
         .expect("A -> B request");
     expect_payload(&mut rx_b, "a2b", "B").await;
@@ -155,7 +163,7 @@ async fn pubsub_delivers_in_both_directions() {
         .to_string()
         .into_bytes();
     node_b
-        .request_to(keys_a.id(), "pubsub.msg", p)
+        .request_to(id_a, "pubsub.msg", p)
         .await
         .expect("B -> A request");
     expect_payload(&mut rx_a, "b2a", "A").await;
@@ -166,7 +174,7 @@ async fn pubsub_delivers_in_both_directions() {
             .to_string()
             .into_bytes();
         node_b
-            .request_to(keys_a.id(), "pubsub.msg", p)
+            .request_to(id_a, "pubsub.msg", p)
             .await
             .expect("B -> A repeat request");
         expect_payload(&mut rx_a, &format!("b2a-{i}"), "A").await;

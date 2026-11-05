@@ -1,11 +1,11 @@
 //! PQ handshake tests (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
 //!
 //! Scope: `infnode` crate only. Covers the PQ handshake paths added in
-//! `proto.rs` (transcript/tag/policy, KEM-hybrid + Falcon-512 tag) and
+//! `proto.rs` (transcript/tag/policy, KEM-only + Falcon-512 tag) and
 //! `node.rs` (ML-KEM-768 offer/answer, PQ identity registry + announce):
 //! KAT pins where possible (Wycheproof ML-KEM-768 vectors, transcript digest),
 //! happy-path agreement, tampered-transcript refusal, wrong-key refusal,
-//! mixed-mode window both directions, hybrid-key properties, PQ identity
+//! mixed-mode window both directions, kem-session-key properties, PQ identity
 //! keygen/load/perms, `pq_pub` announce/bind, Falcon-tag happy/tamper/
 //! wrong-key, absent-identity classical fallback, and classical
 //! invariants (flag OFF = byte-identical classical).
@@ -27,6 +27,7 @@ use infnode::keyring::PqKeys;
 use infnode::node::{
     pq_announce_fields, pq_falcon_transcript_digest, PqBindOutcome, PqIdentityRegistry,
 };
+use infnode::node::{pq_pinned_key_check_cached, FalconPeerKeyCache};
 use infnode::proto::{
     pq_falcon_digest, pq_falcon_policy, pq_falcon_sign, pq_falcon_verify, pq_id_from_pub,
     PQ_FALCON_PK_LEN, PQ_FALCON_SIG_LEN, PQ_SUITE_FALCON512,
@@ -75,10 +76,6 @@ fn fixed_transcript() -> PqTranscript {
 /// Fixed transcript digest KAT (blake3 over the canonical encoding).
 const TRANSCRIPT_DIGEST_KAT: &str =
     "fde16ec184bc2d20cf32570a5180c19cc945cfe1acd64aa3a54fba4dbe7e8b1b";
-
-/// Classical pins: prove the pre-PQ KDFs are untouched.
-const E2E_KAT_HEX: &str = "223572ada7ec7d5a660706223197bf472d691c5b848e5df0187e01b98751baeb";
-const SESSION_KAT_HEX: &str = "4e6ad0085408c0a66a43ad427f6865d0ea4efc462fbf9707c1af9597627cee5a";
 
 // ---------------------------------------------------------------------------
 // 1. Flag parsing.
@@ -184,7 +181,7 @@ fn pq_transcript_encode_shape_and_kat() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Happy path: both sides agree, hybrid key matches.
+// 4. Happy path: both sides agree, kem-only key matches.
 // ---------------------------------------------------------------------------
 
 fn challenge_frame(src: [u8; NODEID_LEN], dst: [u8; NODEID_LEN], payload: Vec<u8>) -> Frame {
@@ -230,7 +227,6 @@ fn pq_handshake_happy_both_sides_agree() {
         "at": auth_at,
         "eph": hex::encode(eph_init),
         "ed": hex::encode([3u8; 32]),
-        "x": hex::encode([4u8; 32]),
         "pq_ver": PQ_TRANSCRIPT_VERSION,
         "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
@@ -267,12 +263,11 @@ fn pq_handshake_happy_both_sides_agree() {
     assert_eq!(agreed_i.shared, agreed_r.shared);
     assert_eq!(agreed_i.digest, agreed_r.digest);
 
-    // Hybrid session keys match on both sides and differ from classical.
-    let classical = [0xCCu8; 32];
-    let k_i = proto::pq_hybrid_session_key(&classical, &agreed_i.shared, &agreed_i.digest);
-    let k_r = proto::pq_hybrid_session_key(&classical, &agreed_r.shared, &agreed_r.digest);
+    // KEM-only session keys match on both sides and differ from the raw shared.
+    let k_i = proto::pq_session_key(&agreed_i.shared, &agreed_i.digest);
+    let k_r = proto::pq_session_key(&agreed_r.shared, &agreed_r.digest);
     assert_eq!(k_i, k_r);
-    assert_ne!(k_i, classical);
+    assert_ne!(k_i, agreed_i.shared);
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +290,6 @@ fn pq_tampered_transcript_refused_with_clear_error() {
             "at": auth_at,
             "eph": hex::encode(eph_init),
             "ed": hex::encode([3u8; 32]),
-            "x": hex::encode([4u8; 32]),
             "pq_ver": PQ_TRANSCRIPT_VERSION,
             "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
             "pq_ek": hex::encode(&offer.ek),
@@ -495,7 +489,6 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
         "at": auth_at,
         "eph": hex::encode(eph_init),
         "ed": hex::encode([3u8; 32]),
-        "x": hex::encode([4u8; 32]),
     });
     let ch = challenge_frame(init_id, resp_id, plain_ch.to_string().into_bytes());
     let got = pq_responder_accept(&eph_init, &plain_ch, &ch.sign_data(), &eph_resp, auth_at, &resp_id)
@@ -529,7 +522,7 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Hybrid key properties + transcript tamper coverage at the digest layer.
+// 8. KEM-only session-key properties + transcript tamper coverage at the digest layer.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -560,23 +553,19 @@ fn pq_transcript_builder_matches_manual_fields() {
 }
 
 #[test]
-fn pq_hybrid_key_deterministic_and_binds_every_input() {
-    let classical = [0xCCu8; 32];
+fn pq_kem_session_key_deterministic_and_binds_every_input() {
     let shared = [0xDDu8; 32];
     let digest = [0xEEu8; 32];
-    let k0 = proto::pq_hybrid_session_key(&classical, &shared, &digest);
-    assert_eq!(k0, proto::pq_hybrid_session_key(&classical, &shared, &digest));
-    assert_ne!(k0, classical);
+    let k0 = proto::pq_session_key(&shared, &digest);
+    assert_eq!(k0, proto::pq_session_key(&shared, &digest));
     assert_ne!(k0, shared);
-    let mut c2 = classical;
-    c2[0] ^= 0x01;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&c2, &shared, &digest));
+    assert_ne!(k0, digest);
     let mut s2 = shared;
     s2[31] ^= 0x80;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&classical, &s2, &digest));
+    assert_ne!(k0, proto::pq_session_key(&s2, &digest));
     let mut d2 = digest;
     d2[15] ^= 0x01;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&classical, &shared, &d2));
+    assert_ne!(k0, proto::pq_session_key(&shared, &d2));
 }
 
 #[test]
@@ -621,28 +610,23 @@ fn pq_transcript_tamper_anywhere_breaks_tag() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Classical invariants: flag OFF = byte-identical classical behavior.
+// 9. KEM-only KDF pin + frame-auth (classical X3DH KDFs deleted).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pq_classical_kdfs_and_frame_auth_unchanged() {
-    // Pinned vectors: any change to the classical KDFs breaks these.
-    let e2e = proto::e2e_key_from_shared(&[0x11u8; 32], &[1u8; 20], &[2u8; 20]);
-    assert_eq!(hex::encode(e2e), E2E_KAT_HEX);
-    let sess = proto::session_key(
-        &[0x11u8; 32],
-        &[0x22u8; 32],
-        &[0x33u8; 32],
-        &[0x44u8; 32],
-        &[1u8; 20],
-        &[2u8; 20],
+fn pq_kem_session_kdf_and_frame_auth_unchanged() {
+    // Pinned vector: any change to the KEM-only session KDF breaks this
+    // (same value as the `kex_session_tests` KEM pin — one derivation).
+    let k = proto::pq_session_key(&[0xDDu8; 32], &[0xEEu8; 32]);
+    assert_eq!(
+        hex::encode(k),
+        "f30ff66edf2b9ae8703eda331622c43f37ee768b8dd26750ba42111955d08818"
     );
-    assert_eq!(hex::encode(sess), SESSION_KAT_HEX);
-    // Classical CHALLENGE payload with extra pq_* fields still parses through
+    // KEM-only CHALLENGE payload with extra pq_* fields still parses through
     // the known-keys path (window tolerance is structural: unknown JSON keys
     // are ignored by key lookup).
     let v: serde_json::Value = serde_json::from_str(
-        r#"{"nonce":"abcdef0123456789","at":1700000000001,"eph":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","ed":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100","x":"102030405060708090a0b0c0d0e0f101102030405060708090a0b0c0d0e0f101","pq_ver":1,"pq_suite":77,"pq_ek":"zz"}"#,
+        r#"{"nonce":"abcdef0123456789","at":1700000000001,"eph":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","ed":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100","pq_ver":1,"pq_suite":77,"pq_ek":"zz"}"#,
     )
     .expect("json");
     assert_eq!(v["nonce"].as_str().unwrap(), "abcdef0123456789");
@@ -775,9 +759,7 @@ fn pq_identity_wrong_perms_fail_closed() {
 fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
     PeerConfig {
         name: "p".to_string(),
-        node_id: format!("inf1:{}", hex::encode([1u8; 20])),
         ed_pub: hex::encode([2u8; 32]),
-        x_pub: hex::encode([3u8; 32]),
         pq_pub,
         endpoints: vec![],
         allow: vec!["*".to_string()],
@@ -789,7 +771,9 @@ fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
 
 #[test]
 fn pq_peer_config_pq_pub_optional_and_pinned() {
-    // Absent: classical-only peer, explicit — not an error.
+    // Absent (code-constructed dynamic): classical-explicit, not an error
+    // at `pq_bytes` (parsed configs without `pq-pub` fail LOUDLY at parse,
+    // see `pq_peer_config_yaml_*` + `ceremony_05`).
     assert!(pq_peer_cfg(None).pq_bytes().expect("none").is_none());
     // Present and well-formed: parses to 897 bytes.
     let keys = PqKeys::from_seed([0x5Au8; 32]);
@@ -805,13 +789,27 @@ fn pq_peer_config_pq_pub_optional_and_pinned() {
 
 #[test]
 fn pq_peer_config_yaml_backward_compatible() {
-    // Old configs without pq-pub parse unchanged (serde default).
-    let old: PeerConfig = serde_yaml::from_str(
+    // Old configs without pq-pub FAIL LOUDLY at parse (FULL-PQ wipe, no
+    // compat) — never silently classical.
+    let err = serde_yaml::from_str::<PeerConfig>(
+        "name: a\ned-pub: '0202020202020202020202020202020202020202020202020202020202020202'\nendpoints: []\n",
+    )
+    .expect_err("ed-only without pq-pub must fail at parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FULL-PQ") || msg.contains("pq-pub") || msg.contains("mandatory"),
+        "migration error must be clear, got: {msg}"
+    );
+    // Old shape with node-id/x-pub also fails loudly.
+    let err_old = serde_yaml::from_str::<PeerConfig>(
         "name: a\nnode-id: inf1:0102030405060708090a0b0c0d0e0f1011121314\ned-pub: '0202020202020202020202020202020202020202020202020202020202020202'\nx-pub: '0303030303030303030303030303030303030303030303030303030303030303'\nendpoints: []\n",
     )
-    .expect("old yaml");
-    assert!(old.pq_pub.is_none());
-    assert!(old.pq_bytes().expect("none").is_none());
+    .expect_err("legacy node-id/x-pub must fail at parse");
+    let msg_old = err_old.to_string();
+    assert!(
+        msg_old.contains("FULL-PQ") || msg_old.contains("node-id") || msg_old.contains("x-pub"),
+        "migration error must be clear, got: {msg_old}"
+    );
     // New configs carry pq-pub (kebab-case) and round-trip.
     let keys = PqKeys::from_seed([0x5Au8; 32]);
     let mut cfg = pq_peer_cfg(None);
@@ -1241,4 +1239,266 @@ fn pq_identity_load_or_generate_corrupt_hard_errors() {
     // Unreadable (missing after dir exists... absent regenerates; a
     // directory that cannot be written fails instead of downgrading).
     pq_cleanup(&d);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Long-term PQ peer-key cache: verify ONCE per distinct key, exact
+// invalidation on rotation/registry change, tampered-at-rotate fails,
+// per-handshake checks still run fresh. (Perf zone: static-key check only.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_longterm_cache_same_key_hits_once() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let pk_a = a.pq_pub();
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.is_empty());
+    // First check verifies fresh (miss) and caches true.
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    assert_eq!(c.get(&pk_a), Some(true));
+    // Second check of identical bytes hits (no recompute observable here,
+    // but len stays 1 and verdict identical).
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    // Malformed key caches false (fail-closed), still keyed by bytes.
+    let bad = vec![0x77u8; 32];
+    assert!(!c.check(&bad));
+    assert_eq!(c.get(&bad), Some(false));
+    assert_eq!(c.len(), 2);
+    assert!(!c.check(&bad));
+    assert_eq!(c.len(), 2);
+}
+
+#[test]
+fn pq_longterm_cache_rotation_reverifies_not_stale() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let pk_a = a.pq_pub();
+    let pk_b = b.pq_pub();
+    assert_ne!(pk_a, pk_b);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    // Rotation: different bytes => miss => fresh verify of the NEW key
+    // (proves no stale-key-after-rotation hit).
+    assert!(c.get(&pk_b).is_none(), "rotated key must miss before verify");
+    assert!(c.check(&pk_b));
+    assert_eq!(c.len(), 2);
+    assert_eq!(c.get(&pk_a), Some(true));
+    assert_eq!(c.get(&pk_b), Some(true));
+    // Exact invalidation: dropping the old entry forces re-verify.
+    assert!(c.invalidate(&pk_a));
+    assert!(c.get(&pk_a).is_none());
+    assert!(c.check(&pk_a), "re-verify after invalidate must pass again");
+    assert!(!c.invalidate(&vec![0x00u8; 897]), "unknown bytes invalidate=false");
+}
+
+#[test]
+fn pq_longterm_cache_registry_change_clears() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&a.pq_pub()));
+    assert!(c.check(&b.pq_pub()));
+    assert_eq!(c.len(), 2);
+    // Registry/config change => clear all; both keys must re-verify fresh.
+    c.clear();
+    assert!(c.is_empty());
+    assert!(c.get(&a.pq_pub()).is_none());
+    assert!(c.check(&a.pq_pub()));
+    assert!(c.check(&b.pq_pub()));
+    assert_eq!(c.len(), 2);
+}
+
+#[test]
+fn pq_longterm_cache_tampered_at_rotate_fails() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let pk_a = a.pq_pub();
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&pk_a));
+    // Tampered rotation target: same length, one bit flipped => the FULL
+    // per-handshake verify must fail, never a stale accept from the honest
+    // entry. (The static parse cache is keyed by exact bytes so the tampered
+    // bytes always miss first; whether the tampered bytes themselves parse
+    // is irrelevant — the tag verify over the fresh digest refuses.)
+    let mut tampered = pk_a.clone();
+    tampered[10] ^= 0x01;
+    assert_ne!(tampered, pk_a);
+    assert!(c.get(&tampered).is_none(), "tampered bytes must miss, never stale-hit");
+    let _ = c.check(&tampered); // cache the tampered bytes' own parse verdict
+    // Honest entry untouched by the tampered check.
+    assert_eq!(c.get(&pk_a), Some(true));
+    // Full per-handshake tag verify refuses the tampered key either way.
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    assert!(!pq_falcon_verify(&tampered, &digest, &sig));
+    assert_eq!(
+        pq_falcon_policy(true, Some(&tampered), &digest, Some(&sig)).unwrap_err(),
+        "pq falcon tag failed",
+        "tampered key at rotate must be refused by policy"
+    );
+    assert!(pq_falcon_verify(&pk_a, &digest, &sig));
+    // Truncated key (wrong length) is statically invalid AND refused.
+    assert!(!c.check(&tampered[..100]));
+    assert_eq!(
+        pq_falcon_policy(true, Some(&tampered[..100]), &digest, Some(&sig)).unwrap_err(),
+        "pq identity malformed"
+    );
+}
+
+#[test]
+fn pq_longterm_cache_per_handshake_checks_still_fresh() {
+    use infnode::node::FalconPeerKeyCache;
+    // Static cache HIT on the honest long-term key...
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&a.pq_pub()));
+    assert_eq!(c.get(&a.pq_pub()), Some(true));
+    // ...must NOT excuse per-handshake failures: tampered digest, wrong-key
+    // tag, and tampered KEM ct are all still refused every handshake.
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    let mut bad_digest = digest;
+    bad_digest[0] ^= 0x01;
+    assert!(!pq_falcon_verify(&a.pq_pub(), &bad_digest, &sig));
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let cross = b.sign_digest(&digest);
+    assert!(!pq_falcon_verify(&a.pq_pub(), &digest, &cross));
+    // KEM ct tamper still breaks the transcript tag (responder/initiator).
+    let init_id = [9u8; NODEID_LEN];
+    let resp_id = [7u8; NODEID_LEN];
+    let eph_init = [0x11u8; 32];
+    let eph_resp = [0x22u8; 32];
+    let auth_at = 1_700_000_000_001i64;
+    let offer = pq_initiator_offer().expect("offer");
+    let ch_json = serde_json::json!({
+        "nonce": "abcdef0123456789", "at": auth_at,
+        "eph": hex::encode(eph_init), "ed": hex::encode([3u8; 32]),
+        "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&offer.ek),
+    });
+    let ch = challenge_frame(init_id, resp_id, ch_json.to_string().into_bytes());
+    let ch_sd = ch.sign_data();
+    let (ct, agreed_r) = pq_responder_accept(
+        &eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id,
+    )
+    .expect("accept")
+    .expect("offer");
+    assert_eq!(ct.len(), 1088);
+    // Flip one ct byte in the AUTH answer: initiator must refuse with a
+    // clear transcript-auth error even though the static key is cache-valid.
+    let mut bad_ct = ct.clone();
+    bad_ct[0] ^= 0x01;
+    let bad_auth_json = serde_json::json!({
+        "node": format!("inf1:{}", hex::encode(resp_id)), "name": "resp", "at": auth_at,
+        "eph": hex::encode(eph_resp), "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ct": hex::encode(&bad_ct), "pq_tag": hex::encode(agreed_r.tag),
+    });
+    let bad_auth = auth_frame(resp_id, init_id, bad_auth_json.to_string().into_bytes());
+    let err = match pq_initiator_answer(&Some(offer), &ch_sd, &eph_init, &bad_auth) {
+        Ok(_) => "ACCEPTED".to_string(),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        err.contains("pq transcript auth failed"),
+        "tampered KEM ct must still be refused on cache-hit key, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 18. Accept-path pinned-key gate (`pq_pinned_key_check_cached`): the exact
+// helper `handle_stream` runs for known peers — cached static parse only.
+// Absent = classical-explicit (no entry), pinned-valid = Ok(true) once,
+// malformed = fail-closed Err, rotation re-verifies, tampered-at-rotate
+// fails. (Perf zone: static-key check only; tag/KEM/freshness untouched.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_accept_gate_absent_is_classical_no_entry() {
+    let mut c = FalconPeerKeyCache::new();
+    assert!(!pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(None)).expect("absent"));
+    assert!(c.is_empty(), "classical-explicit peer must not populate the cache");
+}
+
+#[test]
+fn pq_accept_gate_pinned_valid_caches_once() {
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let mut cfg = pq_peer_cfg(None);
+    cfg.pq_pub = Some(keys.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("valid"));
+    assert_eq!(c.len(), 1);
+    // Second handshake from the same peer: cached verdict, no recompute entry.
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("valid"));
+    assert_eq!(c.len(), 1);
+}
+
+#[test]
+fn pq_accept_gate_malformed_pin_refuses() {
+    let mut c = FalconPeerKeyCache::new();
+    // Bad hex length.
+    assert!(pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some("00".to_string()))).is_err());
+    // Right type, wrong length.
+    assert!(
+        pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some(hex::encode([9u8; 32])))).is_err()
+    );
+    // Right length, not a Falcon-512 point (all-zero).
+    assert!(
+        pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some(hex::encode([0u8; 897])))).is_err()
+    );
+}
+
+#[test]
+fn pq_accept_gate_rotation_reverifies_not_stale() {
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let mut cfg_a = pq_peer_cfg(None);
+    cfg_a.pq_pub = Some(a.pq_pub_hex());
+    let mut cfg_b = pq_peer_cfg(None);
+    cfg_b.pq_pub = Some(b.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_a).expect("a"));
+    // Rotation: the new bytes miss before verify (proves no stale hit).
+    assert!(c.get(&b.pq_pub()).is_none(), "rotated key must miss before verify");
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_b).expect("b"));
+    assert_eq!(c.len(), 2);
+    // Exact invalidation of the old pin forces fresh re-verify.
+    assert!(c.invalidate(&a.pq_pub()));
+    assert!(c.get(&a.pq_pub()).is_none());
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_a).expect("a re-verify"));
+}
+
+#[test]
+fn pq_accept_gate_tampered_at_rotate_fails() {
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let mut cfg = pq_peer_cfg(None);
+    cfg.pq_pub = Some(a.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("honest"));
+    // Tampered rotation target: one bit flipped. The gate must refuse it —
+    // never a stale accept from the honest entry.
+    let mut tampered = a.pq_pub();
+    tampered[10] ^= 0x01;
+    let mut bad_cfg = pq_peer_cfg(None);
+    bad_cfg.pq_pub = Some(hex::encode(&tampered));
+    // If the tampered bytes still happen to parse as a point, the gate would
+    // accept the STATIC parse — but the per-handshake tag verify over the
+    // fresh digest must refuse either way (belt and suspenders, proved here).
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    assert!(
+        !pq_falcon_verify(&tampered, &digest, &sig),
+        "tampered key must fail the per-handshake tag verify"
+    );
+    // And the all-zero key (guaranteed non-point) is refused by the gate.
+    let mut zero_cfg = pq_peer_cfg(None);
+    zero_cfg.pq_pub = Some(hex::encode([0u8; 897]));
+    assert!(pq_pinned_key_check_cached(&mut c, &zero_cfg).is_err());
+    // Honest entry untouched.
+    assert_eq!(c.get(&a.pq_pub()), Some(true));
 }

@@ -21,8 +21,13 @@
 //! signatures.
 //!
 //! =========================================================================
-//! AUDIT — current classical auth / KEX / identity / TLS primitives
-//! (read-only; paths relative to infnode/, crate `infnode`).
+//! AUDIT — classical auth / KEX / identity / TLS primitives AS THEY WERE
+//! pre-PQ (read-only; paths relative to infnode/, crate `infnode`).
+//! HISTORICAL BASELINE: rows below describe the pre-wipe shapes
+//! (`node_id`/`x_pub`/`x_bytes`, X3DH KEX, ed-derived NodeId) — all excised
+//! by the FULL-PQ wipe (KEM-only sessions, PQ-only NodeId, no static X25519).
+//! Live shapes: see `config.rs` (PeerConfig), `keyring.rs` (NodeKeys/PqKeys),
+//! `dht.rs` (`node_info_valid`), `node.rs` (`register_dns_candidate`).
 //! =========================================================================
 //! | # | primitive | location |
 //! |---|-----------|----------|

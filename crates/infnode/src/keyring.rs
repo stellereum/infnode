@@ -5,7 +5,6 @@ use falcon_rust::falcon512;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::path::Path;
-use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 /// Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
@@ -157,8 +156,13 @@ pub fn secure_dir(dir: &Path) -> Result<()> {
 pub struct NodeKeys {
     pub signing: SigningKey,
     pub verifying: VerifyingKey,
-    pub e2e_sec: StaticSecret,
-    pub e2e_pub: PublicKey,
+    /// Long-term ML-KEM-768 seed (64 bytes, `d || z`); the sole secret input
+    /// for the KEM encapsulation key below.
+    /// FULL-PQ: replaces the X25519 static secret (wipe — no ECDH material
+    /// remains on disk; old 32-byte `e2e.key` files are refused, see `load`).
+    pub kem_seed: [u8; crate::mailbox::KEM_SEED_LEN],
+    /// ML-KEM-768 encapsulation key (1184 bytes) derived from `kem_seed`.
+    pub kem_ek: Vec<u8>,
 }
 
 impl NodeKeys {
@@ -166,27 +170,24 @@ impl NodeKeys {
         let mut csprng = OsRng;
         let signing = SigningKey::generate(&mut csprng);
         let verifying = signing.verifying_key();
-        let e2e_sec = StaticSecret::random_from_rng(OsRng);
-        let e2e_pub = PublicKey::from(&e2e_sec);
+        let mut kem_seed = [0u8; crate::mailbox::KEM_SEED_LEN];
+        OsRng.fill_bytes(&mut kem_seed);
+        let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
         Self {
             signing,
             verifying,
-            e2e_sec,
-            e2e_pub,
+            kem_seed,
+            kem_ek,
         }
     }
 
     pub fn id(&self) -> [u8; NODEID_LEN] {
-        // LEGACY alias (classical `blake3(ed_pub)[..20]`). Byte-identical and
-        // stable: pre-ceremony configs, pins, DHT entries and tests keep
-        // working through the migration window (see `LEGACY_ALIAS_END_UNIX_MS`
-        // + `legacy_alias_accepted_at`). The canonical post-ceremony
-        // derivation is `resolve_node_id` below (PQ-primary when a PQ identity
-        // exists); `id()` is the explicit LEGACY arm of that rule, marked by
-        // `NodeIdKind::Legacy` in type and in startup logs (`node.rs`).
-        // The PQ long-term id rides alongside (`PqKeys::pq_id`, display/
-        // binding helper, `inf1:`-rendered) with first-PQ-wins sticky binding
-        // (`node::PqIdentityRegistry`); routes still key on the resolved id.
+        // NON-CANONICAL helper: classical `blake3(ed_pub)[..20]`.
+        // FULL-PQ: this is NOT a NodeId and is never honored as one.
+        // Canonical NodeId is PQ-only (`resolve_node_id`, `PqKeys::pq_id`).
+        // Retained only for pre-existing route/TLS-pin call sites outside
+        // this zone (handshake-auth policy frozen); new code must not use it
+        // for identity.
         let h = blake3::hash(self.verifying.as_bytes());
         let mut id = [0u8; NODEID_LEN];
         id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
@@ -201,19 +202,20 @@ impl NodeKeys {
         hex::encode(self.verifying.as_bytes())
     }
 
-    pub fn x_hex(&self) -> String {
-        hex::encode(self.e2e_pub.as_bytes())
+    /// Hex of the ML-KEM-768 encapsulation key (1184 bytes).
+    pub fn kem_ek_hex(&self) -> String {
+        hex::encode(&self.kem_ek)
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         secure_dir(dir)?;
         // Шифруем (если задана пассфраза) и пишем с правами 0600.
         let mut id_hex = hex::encode(self.signing.to_bytes());
-        let mut e2e_hex = hex::encode(self.e2e_sec.to_bytes());
+        let mut kem_hex = hex::encode(self.kem_seed);
         write_private(&dir.join("identity.key"), &protect(id_hex.as_bytes()))?;
-        write_private(&dir.join("e2e.key"), &protect(e2e_hex.as_bytes()))?;
+        write_private(&dir.join("e2e.key"), &protect(kem_hex.as_bytes()))?;
         id_hex.zeroize();
-        e2e_hex.zeroize();
+        kem_hex.zeroize();
         Ok(())
     }
 
@@ -255,25 +257,33 @@ impl NodeKeys {
         let e2e =
             std::fs::read_to_string(dir.join("e2e.key")).map_err(|e| anyhow!("e2e.key: {e}"))?;
         let mut id_plain = unprotect(id.trim())?;
-        let mut e2e_plain = unprotect(e2e.trim())?;
+        let mut kem_plain = unprotect(e2e.trim())?;
         let id_bytes: [u8; 32] = hex::decode(id_plain.trim())?
             .try_into()
             .map_err(|_| anyhow!("identity seed должен быть 32 байта"))?;
-        let e2e_bytes: [u8; 32] = hex::decode(e2e_plain.trim())?
+        let kem_bytes = hex::decode(kem_plain.trim())?;
+        if kem_bytes.len() == 32 {
+            // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
+            // refused loudly, never silently accepted as KEM material.
+            kem_plain.zeroize();
+            bail!(
+                "e2e.key: legacy x25519 key refused (FULL-PQ wipe: delete e2e.key and restart to generate a KEM key)"
+            );
+        }
+        let kem_seed: [u8; crate::mailbox::KEM_SEED_LEN] = kem_bytes
             .try_into()
-            .map_err(|_| anyhow!("e2e seed должен быть 32 байта"))?;
+            .map_err(|_| anyhow!("e2e kem seed должен быть 64 байта"))?;
         // Стереть промежуточные plaintext-строки из памяти
         id_plain.zeroize();
-        e2e_plain.zeroize();
+        kem_plain.zeroize();
         let signing = SigningKey::from_bytes(&id_bytes);
         let verifying = signing.verifying_key();
-        let e2e_sec = StaticSecret::from(e2e_bytes);
-        let e2e_pub = PublicKey::from(&e2e_sec);
+        let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
         Ok(Self {
             signing,
             verifying,
-            e2e_sec,
-            e2e_pub,
+            kem_seed,
+            kem_ek,
         })
     }
 }
@@ -286,17 +296,20 @@ impl NodeKeys {
 /// - contents: `protect()` envelope over the hex-encoded 32-byte Falcon
 ///   seed (same Argon2id+XChaCha20-Poly1305 envelope + 0600 file / 0700 dir
 ///   discipline as the classical keys; see `NodeKeys::save`);
-/// - absent file = classical-only node, explicit (see
-///   [`PqKeys::load_opt`]); corrupt content or insecure permissions =
-///   hard error, never a silent classical fallback (fail closed).
+/// - absent file = no PQ identity yet, explicit (see [`PqKeys::load_opt`];
+///   first boot enrols via [`PqKeys::load_or_generate`]); corrupt content
+///   or insecure permissions = hard error, never a silent classical
+///   fallback (fail closed, FULL-PQ wipe — no classical-only mode).
 ///
 /// The seed is the sole secret input: `falcon_rust::falcon512::keygen` is
 /// deterministic, so the keypair regenerates byte-identically from it
 /// (pinned by test). Storing the seed (not the 1281-byte secret encoding)
 /// keeps the file small; secrecy is equivalent — guard it like a key.
 ///
-/// `NodeId` derivation is UNCHANGED: use [`PqKeys::pq_id`] (display/binding
-/// helper, `inf1:`-rendered) alongside the classical id; never as `NodeId`.
+/// FULL-PQ: [`PqKeys::pq_id`] IS the canonical `NodeId`
+/// (`blake3("infnode-pqid-v1" || falcon_pk)[..20]`, `inf1:`-rendered via
+/// [`PqKeys::pq_id_hex` / `keyring::resolve_node_id`]); there is no
+/// classical fallback.
 pub const PQ_IDENTITY_FILE: &str = "pq-identity.key";
 
 #[derive(Clone)]
@@ -338,13 +351,13 @@ impl PqKeys {
         self.secret.to_bytes()
     }
 
-    /// PQ display/binding id: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`.
-    /// Announced alongside the classical id; NOT the `NodeId` (see above).
+    /// Canonical PQ `NodeId`: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`
+    /// (FULL-PQ wipe — the ONLY `NodeId`; see `resolve_node_id`).
     pub fn pq_id(&self) -> [u8; NODEID_LEN] {
         crate::proto::pq_id_from_pub(&self.pq_pub())
     }
 
-    /// `inf1:`-rendered PQ id (same alphabet as the classical id).
+    /// `inf1:`-rendered canonical PQ `NodeId` (same alphabet as legacy ids).
     pub fn pq_id_hex(&self) -> String {
         format!("inf1:{}", hex::encode(self.pq_id()))
     }
@@ -438,52 +451,34 @@ impl PqKeys {
 }
 
 // ---------------------------------------------------------------------------
-// NodeId re-ceremony: PQ identity becomes primary, with a migration window.
+// NodeId re-ceremony: PQ identity is PRIMARY and MANDATORY (FULL-PQ wipe).
 //
 // Derivation rule (one line): `NodeId = blake3("infnode-pqid-v1"||falcon_pk)[..20]`
-// when a PQ identity exists, else legacy `blake3(ed_pub)[..20]` marked LEGACY.
-// * PQ arm reuses `PqKeys::pq_id` (which reuses `proto::pq_id_from_pub`) —
-//   no duplicate hashing logic lives here.
-// * Legacy arm (`NodeKeys::id`) is byte-identical to the pre-ceremony id, so
-//   old single-ed configs keep working until the window end below.
-// * `pq-identity.key` auto-gen already exists (`PqKeys::load_or_generate`);
-//   nothing new is invented here — call it at startup to enrol PQ.
-// * Window end: `LEGACY_ALIAS_END_UNIX_MS` (far-future default, documented).
-//   Enforcement is a pure predicate on an injected clock
-//   (`legacy_alias_accepted_at`); no timers or wall-clock reads in this code.
+// via `PqKeys::pq_id` (which reuses `proto::pq_id_from_pub` — no duplicate
+// hashing logic lives here).
+//
+// No migration window, no legacy alias: the classical `blake3(ed_pub)[..20]`
+// (`NodeKeys::id`) is NOT a NodeId and is never honored as one. Callers
+// requiring the canonical id use `resolve_node_id` (PQ-only) or
+// `ceremony_local_id`. `NodeKeys::id` remains only as a non-canonical
+// helper for pre-existing route/TLS-pin call sites outside this zone
+// (handshake-auth policy is frozen); it must NOT be used for new identity
+// logic.
 // ---------------------------------------------------------------------------
 
-/// End of the migration window: Unix millis after which the legacy classical
-/// alias is dropped and legacy-only peers are refused.
-///
-/// Default: 2035-01-01T00:00:00Z (far future — operators get years to enrol
-/// `pq-identity.key`; tightening it is a one-line const change + spec note,
-/// never a behavior patch). No timer fires in code: callers pass an injected
-/// clock to `legacy_alias_accepted_at` (tests never touch wall-clock).
-pub const LEGACY_ALIAS_END_UNIX_MS: i64 = 2_051_222_400_000;
-
-/// Pure window gate: true while the legacy classical alias is still honored.
-/// `now_unix_ms` is caller-supplied (injected clock — no wall-clock read).
-pub fn legacy_alias_accepted_at(now_unix_ms: i64) -> bool {
-    now_unix_ms < LEGACY_ALIAS_END_UNIX_MS
-}
-
-/// Which arm of the re-ceremony derivation produced a `NodeId`. The legacy
-/// arm is explicit in the type (`Legacy`) and in startup logs (`node.rs`
-/// emits `node_id_kind` with this label) — a classical-only node is always
-/// visibly LEGACY, never silently classical.
+/// Which arm of the re-ceremony derivation produced a `NodeId`.
+/// FULL-PQ: only the PQ arm exists. Kept as an enum (single variant) so
+/// log/telemetry call sites (`node_id_kind`) keep a stable type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeIdKind {
     Pq,
-    Legacy,
 }
 
 impl NodeIdKind {
-    /// Short label for logs and `node_id_kind` telemetry (`"PQ"`/`"LEGACY"`).
+    /// Short label for logs and `node_id_kind` telemetry (`"PQ"`).
     pub fn label(self) -> &'static str {
         match self {
             NodeIdKind::Pq => "PQ",
-            NodeIdKind::Legacy => "LEGACY",
         }
     }
 }
@@ -496,12 +491,13 @@ pub struct ResolvedNodeId {
 }
 
 impl ResolvedNodeId {
-    /// True for the legacy classical arm (pre-window-end compat only).
+    /// Always false post-excision (no legacy arm exists). Kept for call-site
+    /// compat so `is_legacy()` checks fail closed without rewiring.
     pub fn is_legacy(self) -> bool {
-        self.kind == NodeIdKind::Legacy
+        false
     }
 
-    /// `"PQ"` or `"LEGACY"` (log/telemetry mark).
+    /// `"PQ"` (log/telemetry mark).
     pub fn kind_label(self) -> &'static str {
         self.kind.label()
     }
@@ -512,47 +508,35 @@ impl ResolvedNodeId {
     }
 }
 
-/// Canonical NodeId derivation: PQ-primary when a PQ identity exists (via
-/// `PqKeys::pq_id` — same construction as `proto::pq_id_from_pub`, no
-/// duplicate logic), else the byte-identical legacy `blake3(ed_pub)[..20]`
-/// explicitly marked `LEGACY`.
-pub fn resolve_node_id(ed: &NodeKeys, pq: Option<&PqKeys>) -> ResolvedNodeId {
-    match pq {
-        Some(pq) => ResolvedNodeId {
-            id: pq.pq_id(),
-            kind: NodeIdKind::Pq,
-        },
-        None => ResolvedNodeId {
-            id: ed.id(),
-            kind: NodeIdKind::Legacy,
-        },
+/// Canonical NodeId derivation: PQ-only. Requires a PQ identity;
+/// there is no classical fallback (FULL-PQ wipe, no compat).
+pub fn resolve_node_id(_ed: &NodeKeys, pq: &PqKeys) -> ResolvedNodeId {
+    ResolvedNodeId {
+        id: pq.pq_id(),
+        kind: NodeIdKind::Pq,
     }
 }
 
-/// Dual-announce during the window: both ids, PQ FIRST. Legacy-only nodes
-/// announce the single classical alias. Pure ordering rule for the announce
-/// path (wire encoding stays out of scope — see `parse_dual_announce`).
-pub fn dual_announce_ids(ed: &NodeKeys, pq: Option<&PqKeys>) -> Vec<[u8; NODEID_LEN]> {
-    match pq {
-        Some(pq) => vec![pq.pq_id(), ed.id()],
-        None => vec![ed.id()],
-    }
+/// PQ-only announce: the single PQ id. No legacy alias is announced.
+/// Wire encoding stays out of scope — see `parse_dual_announce`.
+pub fn dual_announce_ids(_ed: &NodeKeys, pq: &PqKeys) -> Vec<[u8; NODEID_LEN]> {
+    vec![pq.pq_id()]
 }
 
-/// `inf1:`-rendered dual-announce (same order as `dual_announce_ids`).
-pub fn dual_announce_hex(ed: &NodeKeys, pq: Option<&PqKeys>) -> Vec<String> {
-    dual_announce_ids(ed, pq)
+/// `inf1:`-rendered PQ announce (same order as `dual_announce_ids`).
+pub fn dual_announce_hex(_ed: &NodeKeys, pq: &PqKeys) -> Vec<String> {
+    dual_announce_ids(_ed, pq)
         .iter()
         .map(|id| format!("inf1:{}", hex::encode(id)))
         .collect()
 }
 
-/// Parse an advertised dual-announce: 1–2 `inf1:` ids, fail-closed.
-/// Malformed entries, wrong lengths and lists longer than 2 are refused
-/// (never silently truncated). Order is preserved (PQ first by convention).
+/// Parse an advertised PQ announce: exactly 1 `inf1:` id, fail-closed.
+/// Malformed entries and wrong lengths are refused (never silently
+/// truncated). Kept name for call-site compat.
 pub fn parse_dual_announce(ids: &[String]) -> Result<Vec<[u8; NODEID_LEN]>> {
-    if ids.is_empty() || ids.len() > 2 {
-        bail!("dual announce must carry 1-2 ids");
+    if ids.len() != 1 {
+        bail!("pq announce must carry exactly 1 id");
     }
     ids.iter()
         .map(|s| {

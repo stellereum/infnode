@@ -24,6 +24,10 @@ handshake. Used as a dependency by the node.
 crates/infnode/   the transport: QUIC endpoints, DHT, pubsub, reputation, caps
 ```
 
+Sibling directories (`crates/infmail/`, `contracts/`, `nft/`, `tools-src/`)
+are experimental overlays, not part of the transport — ignore them unless
+you work on mail tooling.
+
 ## Build & test
 
 ```bash

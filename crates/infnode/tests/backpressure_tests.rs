@@ -7,7 +7,7 @@
 //! counters moving on the existing `outbox_dropped` metric.
 
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{
     Node, MAX_APP_SUBS_PER_TOPIC, MAX_CONN_PEERS_TOTAL, MAX_CONNS_PER_PEER,
     MAX_MAIL_CACHE_ENTRIES, MAX_OUTBOX_FLUSH_PER_PEER, MAX_OUTBOX_PEERS_TOTAL,
@@ -54,6 +54,7 @@ async fn test_node(tag: &str) -> (Arc<Node>, PathBuf) {
     let node = Node::new(
         cfg("T", "127.0.0.1:0"),
         NodeKeys::generate(),
+        PqKeys::generate(),
         tmp.clone(),
         PathBuf::new(),
     )
@@ -242,13 +243,11 @@ async fn flush_is_fair_and_honest_throughput_unaffected() {
     let _ = std::fs::remove_dir_all(&tmp2);
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -285,18 +284,20 @@ fn mesh_cfg(name: &str, listen: &str, peers: Vec<PeerConfig>) -> NodeConfig {
 async fn honest_delivery_succeeds_despite_abusive_flood() {
     let base = tmpdir("live");
     let keys_a = NodeKeys::generate();
+    let pq_a = PqKeys::generate();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let listen_a = "127.0.0.1:21100".to_string();
     let listen_b = "127.0.0.1:21101".to_string();
-    let cfg_a = mesh_cfg("live-a", &listen_a, vec![peer_of("b", &keys_b, &listen_b)]);
-    let cfg_b = mesh_cfg("live-b", &listen_b, vec![peer_of("a", &keys_a, &listen_a)]);
+    let cfg_a = mesh_cfg("live-a", &listen_a, vec![peer_of("b", &keys_b, &pq_b, &listen_b)]);
+    let cfg_b = mesh_cfg("live-b", &listen_b, vec![peer_of("a", &keys_a, &pq_a, &listen_a)]);
     let dir_a = base.join("a");
     let dir_b = base.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
-    let node_a = Node::new(cfg_a, keys_a, dir_a, PathBuf::new()).await.unwrap();
-    let id_b = keys_b.id();
-    let node_b = Node::new(cfg_b, keys_b, dir_b, PathBuf::new()).await.unwrap();
+    let node_a = Node::new(cfg_a, keys_a, pq_a, dir_a, PathBuf::new()).await.unwrap();
+    let id_b = pq_b.pq_id();
+    let node_b = Node::new(cfg_b, keys_b, pq_b, dir_b, PathBuf::new()).await.unwrap();
     // Only B serves: A dials on demand inside flush. (Serving A too would
     // start A's background flush loop and make the counts below racy.)
     let hb = tokio::spawn({

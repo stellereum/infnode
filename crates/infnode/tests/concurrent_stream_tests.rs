@@ -12,7 +12,7 @@
 //! style as `pubsub_bidir_tests.rs`.
 
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,13 +46,11 @@ fn cfg(
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -64,8 +62,8 @@ fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
 struct Pair {
     node_a: Arc<Node>,
     node_b: Arc<Node>,
-    keys_a: NodeKeys,
-    keys_b: NodeKeys,
+    pq_a: PqKeys,
+    pq_b: PqKeys,
     tmp: PathBuf,
     a_serve: tokio::task::JoinHandle<anyhow::Result<()>>,
     b_serve: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -81,26 +79,40 @@ impl Pair {
         // connection per node, making the connection-liveness assertions
         // unambiguous (`stable_id()` is local to each endpoint).
         //
-        // B must also be the LOWER node id: `connect_or_get` implements a
+        // B must also be the LOWER PQ node id: `connect_or_get` implements a
         // tie-break where only the lower id initiates (simultaneous open made
         // both handshakes abort -- 6 failed handshakes/second on the live
         // stand). Generate until B wins the coin toss so this fixture keeps
-        // its "only B dials" property under that rule.
+        // its "only B dials" property under that rule (FULL-PQ: tie-break by
+        // PQ id via `ceremony_local_id`, same construction as `Node::new`).
         let keys_a = NodeKeys::generate();
+        let pq_a = PqKeys::generate();
         let mut keys_b = NodeKeys::generate();
+        let mut pq_b = PqKeys::generate();
         for _ in 0..128 {
-            if keys_b.id() < keys_a.id() {
+            let ida = infnode::node::ceremony_local_id(&keys_a, &pq_a);
+            let idb = infnode::node::ceremony_local_id(&keys_b, &pq_b);
+            if idb < ida {
                 break;
             }
             keys_b = NodeKeys::generate();
+            pq_b = PqKeys::generate();
         }
         assert!(
-            keys_b.id() < keys_a.id(),
-            "could not generate a B key with a lower node id"
+            infnode::node::ceremony_local_id(&keys_b, &pq_b)
+                < infnode::node::ceremony_local_id(&keys_a, &pq_a),
+            "could not generate a B key with a lower PQ node id"
         );
         let node_a = Node::new(
-            cfg("A", listen_a, vec![], true, vec!["*".to_string()]),
+            cfg(
+                "A",
+                listen_a,
+                vec![peer_of("B", &keys_b, &pq_b, listen_b)],
+                false,
+                vec![],
+            ),
             keys_a.clone(),
+            pq_a.clone(),
             tmp.join("a"),
             PathBuf::new(),
         )
@@ -110,11 +122,12 @@ impl Pair {
             cfg(
                 "B",
                 listen_b,
-                vec![peer_of("A", &keys_a, listen_a)],
+                vec![peer_of("A", &keys_a, &pq_a, listen_a)],
                 false,
                 vec![],
             ),
             keys_b.clone(),
+            pq_b.clone(),
             tmp.join("b"),
             PathBuf::new(),
         )
@@ -135,8 +148,8 @@ impl Pair {
         Pair {
             node_a,
             node_b,
-            keys_a,
-            keys_b,
+            pq_a,
+            pq_b,
             tmp,
             a_serve,
             b_serve,
@@ -149,7 +162,7 @@ impl Pair {
             .peers
             .read()
             .await
-            .get(&self.keys_a.id())
+            .get(&self.pq_a.pq_id())
             .cloned()
             .expect("B knows A");
         let conn = peer.conn.read().await.clone();
@@ -162,7 +175,7 @@ impl Pair {
             .peers
             .read()
             .await
-            .get(&self.keys_b.id())
+            .get(&self.pq_b.pq_id())
             .cloned()
             .expect("A knows B");
         let sid = peer.conn.read().await.as_ref().map(|c| c.stable_id());
@@ -181,7 +194,7 @@ async fn warm_up(p: &Pair) -> quinn::Connection {
     let echo = tokio::time::timeout(
         Duration::from_secs(10),
         p.node_b
-            .request_to(p.keys_a.id(), "core.echo", b"warm".to_vec()),
+            .request_to(p.pq_a.pq_id(), "core.echo", b"warm".to_vec()),
     )
     .await
     .expect("warm-up timed out")
@@ -211,7 +224,7 @@ async fn two_concurrent_streams_both_get_responses() {
     let fast = tokio::time::timeout(
         Duration::from_secs(3),
         p.node_b
-            .request_to(p.keys_a.id(), "core.echo", b"fast".to_vec()),
+            .request_to(p.pq_a.pq_id(), "core.echo", b"fast".to_vec()),
     )
     .await
     .expect("concurrent request was blocked behind the hung stream")
@@ -250,7 +263,7 @@ async fn failing_stream_does_not_kill_connection() {
     let after = tokio::time::timeout(
         Duration::from_secs(5),
         p.node_b
-            .request_to(p.keys_a.id(), "core.echo", b"after".to_vec()),
+            .request_to(p.pq_a.pq_id(), "core.echo", b"after".to_vec()),
     )
     .await
     .expect("post-failure request timed out")

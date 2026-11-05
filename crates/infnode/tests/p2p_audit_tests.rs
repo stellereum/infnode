@@ -12,7 +12,7 @@
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use infnode::proto::{self, Frame, NODEID_LEN};
 use std::collections::HashMap;
@@ -46,16 +46,15 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>, allow_unknown: bool) ->
 fn peer_of(
     name: &str,
     keys: &NodeKeys,
+    pq: &PqKeys,
     listen: &str,
     rate: u32,
     storage_roles: Vec<String>,
 ) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: rate,
@@ -93,20 +92,22 @@ async fn audit_handshake_flood_is_bounded() {
     let la = "127.0.0.1:19820";
     let lb = "127.0.0.1:19821";
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     // B throttles A to 10 req/s: the flood must surface as explicit
     // rate-limit refusals, not hangs, errors, or an outage.
     let a = Node::new(
-        cfg("A", la, vec![peer_of("B", &kb, lb, 0, vec![])], false),
-        ka.clone(),
+        cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", lb, vec![peer_of("A", &ka, la, 10, vec![])], false),
-        kb.clone(),
+        cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 10, vec![])], false),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -121,7 +122,7 @@ async fn audit_handshake_flood_is_bounded() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
 
     let mut tasks = Vec::new();
     for _ in 0..60u32 {
@@ -171,18 +172,20 @@ async fn audit_oversized_messages_refused() {
     let la = "127.0.0.1:19822";
     let lb = "127.0.0.1:19823";
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", la, vec![peer_of("B", &kb, lb, 0, vec![])], false),
-        ka.clone(),
+        cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", lb, vec![peer_of("A", &ka, la, 0, vec![])], false),
-        kb.clone(),
+        cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 0, vec![])], false),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -197,7 +200,7 @@ async fn audit_oversized_messages_refused() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
 
     // DHT value 2 MiB over the 1 MiB service cap (far under the 32 MiB frame).
     let big_value = "v".repeat(2 * 1024 * 1024);
@@ -409,7 +412,9 @@ fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
         "at": at,
         "eph": hex::encode(eph_pub.as_bytes()),
         "ed": hex::encode(keys.verifying.to_bytes()),
-        "x": hex::encode(keys.e2e_pub.as_bytes()),
+        "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
+        "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
     })
     .to_string()
 }
@@ -420,9 +425,10 @@ async fn audit_forged_auth_refused() {
     let listen: SocketAddr = "127.0.0.1:19824".parse().expect("addr");
     // TOFU on: unknown identities reach the challenge gate (strictest path).
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19824", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -545,19 +551,21 @@ async fn audit_dht_poison_refused() {
     let la = "127.0.0.1:19825";
     let lb = "127.0.0.1:19826";
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     // B believes A stores files only: mail writes from A must be denied.
     let a = Node::new(
-        cfg("A", la, vec![peer_of("B", &kb, lb, 0, vec![])], false),
-        ka.clone(),
+        cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
-    let mut b_peer_a = peer_of("A", &ka, la, 0, vec!["files".to_string()]);
+    let mut b_peer_a = peer_of("A", &ka, &pa, la, 0, vec!["files".to_string()]);
     b_peer_a.allow = vec!["*".to_string()];
-    let b = Node::new(cfg("B", lb, vec![b_peer_a], false), kb.clone(), tmp.join("b"), PathBuf::new())
+    let b = Node::new(cfg("B", lb, vec![b_peer_a], false), kb.clone(), pb.clone(), tmp.join("b"), PathBuf::new())
         .await
         .expect("node B");
     let sa = tokio::spawn({
@@ -569,7 +577,7 @@ async fn audit_dht_poison_refused() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
 
     // Wrong-bucket write from a files-only peer.
     let p = serde_json::json!({ "key": "mail:alice:index", "value": "[]", "ttl": 60 })
@@ -614,6 +622,7 @@ async fn audit_dht_poison_refused() {
     // Poisoned route record: node id bound to an attacker's key is skipped,
     // so a later lookup does not resolve to attacker endpoints.
     let evil = NodeKeys::generate();
+    let evil_pq = PqKeys::generate();
     let poison_id = "inf1:".to_string() + &hex::encode([0xabu8; NODEID_LEN]);
     let routes = serde_json::json!({
         poison_id.clone(): {
@@ -660,18 +669,20 @@ async fn audit_dht_poison_refused() {
         "gossip flood refused"
     );
 
-    // Pure-function record gate pins the rule without network.
+    // Pure-function record gate pins the rule without network (FULL-PQ:
+    // `pq` must derive `id`; `ed` is the frozen auth pin, NOT identity).
     let honest = NodeKeys::generate();
+    let honest_pq = PqKeys::generate();
     assert!(infnode::dht::node_info_valid(
-        &honest.id(),
+        &honest_pq.pq_id(),
         &hex::encode(honest.verifying.to_bytes()),
-        &hex::encode(honest.e2e_pub.as_bytes()),
+        &honest_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
     assert!(!infnode::dht::node_info_valid(
-        &honest.id(),
+        &honest_pq.pq_id(),
         &hex::encode(evil.verifying.to_bytes()),
-        &hex::encode(evil.e2e_pub.as_bytes()),
+        &evil_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
     assert!(!infnode::dht::endpoint_ok("not an endpoint"));
@@ -694,10 +705,12 @@ async fn audit_pubsub_spam_contained() {
     let la = "127.0.0.1:19827";
     let lb = "127.0.0.1:19828";
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", la, vec![peer_of("B", &kb, lb, 0, vec![])], false),
-        ka.clone(),
+        cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -705,8 +718,8 @@ async fn audit_pubsub_spam_contained() {
     .expect("node A");
     // B throttles A to 10/s and also learns A as a DHT peer (discovery-only).
     let b = Node::new(
-        cfg("B", lb, vec![peer_of("A", &ka, la, 10, vec![])], false),
-        kb.clone(),
+        cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 10, vec![])], false),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -721,7 +734,7 @@ async fn audit_pubsub_spam_contained() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
 
     // A huge TTL is clamped, not amplified: answered ok, no hang.
     let p = serde_json::json!({ "topic": "audit", "data": "x", "ttl": u64::MAX })
@@ -765,17 +778,17 @@ async fn audit_pubsub_spam_contained() {
     // no-op and the assertions below would read the static entry.
     let b2 = Node::new(
         cfg("B2", "127.0.0.1:19829", vec![], false),
-        NodeKeys::generate(),
+        NodeKeys::generate(), PqKeys::generate(),
         tmp.join("b2"),
         PathBuf::new(),
     )
     .await
     .expect("node B2");
     b2.ensure_dht_peer(&infnode::dht::NodeInfo {
-        id: ka.id(),
+        id: pa.pq_id(),
         endpoints: vec![la.to_string()],
         ed_hex: hex::encode(ka.verifying.to_bytes()),
-        x_hex: hex::encode(ka.e2e_pub.as_bytes()),
+        pq_hex: pa.pq_pub_hex(),
         last_seen: infnode::dht::now_ms(),
     })
     .await
@@ -784,7 +797,7 @@ async fn audit_pubsub_spam_contained() {
         .peers
         .read()
         .await
-        .get(&ka.id())
+        .get(&pa.pq_id())
         .cloned()
         .expect("dynamic peer present");
     assert_eq!(

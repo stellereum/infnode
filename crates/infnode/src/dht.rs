@@ -30,13 +30,15 @@ pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 /// only ever ADD fresh entries, so this strictly shrinks the table.
 pub const ROUTING_STALE_AFTER_MS: i64 = 24 * 3600 * 1000;
 
-/// Узел в таблице маршрутизации.
+/// Узел в таблице маршрутизации (FULL-PQ: `id` is the PQ id via
+/// `proto::pq_id_from_pub`; `ed_hex` is the frozen auth/TLS pin (NOT
+/// identity); `pq_hex` is the pinned Falcon-512 key that MUST derive `id`).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct NodeInfo {
     pub id: [u8; NODEID_LEN],
     pub endpoints: Vec<String>,
     pub ed_hex: String,
-    pub x_hex: String,
+    pub pq_hex: String,
     pub last_seen: i64,
 }
 
@@ -51,14 +53,15 @@ pub fn endpoint_ok(ep: &str) -> bool {
 
 /// Fail-closed gate for routing records arriving over the network
 /// (`dht.update`, `dht.find_node` answers, `dht.find_value` hints):
-/// the ed key must be a 32-byte hex key that actually derives `id`
-/// (otherwise anyone could bind an honest node id to their own key and
-/// hijack discovery), an optional x key must be valid if present, and
-/// endpoints are filtered to dialable ones.
+/// FULL-PQ — `id` MUST equal `pq_id_from_pub(pq)` (otherwise anyone could
+/// bind an honest PQ id to their own key and hijack discovery); `ed_hex`
+/// must be a valid 32-byte hex key (frozen auth/TLS pin, NOT identity —
+/// verified separately at handshake/TLS, never for identity); endpoints are
+/// filtered to dialable ones.
 pub fn node_info_valid(
     id: &[u8; NODEID_LEN],
     ed_hex: &str,
-    x_hex: &str,
+    pq_hex: &str,
     endpoints: &[String],
 ) -> bool {
     let ed: [u8; 32] = match hex::decode(ed_hex) {
@@ -68,17 +71,16 @@ pub fn node_info_valid(
         },
         Err(_) => return false,
     };
-    let derived = blake3::hash(&ed);
-    if derived.as_bytes()[..NODEID_LEN] != id[..] {
+    let _ = ed;
+    let pq: Vec<u8> = match hex::decode(pq_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if pq.len() != crate::proto::PQ_FALCON_PK_LEN {
         return false;
     }
-    if !x_hex.is_empty() {
-        let Ok(x) = hex::decode(x_hex) else {
-            return false;
-        };
-        if x.len() != 32 {
-            return false;
-        }
+    if crate::proto::pq_id_from_pub(&pq) != *id {
+        return false;
     }
     if endpoints.len() > crate::proto::MAX_ENDPOINTS_PER_NODE {
         return false;

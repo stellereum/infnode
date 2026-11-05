@@ -1,12 +1,12 @@
-//! Transport-KEX full: AEAD frame bodies under the established hybrid
+//! Transport-KEX full: AEAD frame bodies under the established KEM-only
 //! session key when PQ is negotiated.
 //!
 //! Scope: `proto.rs` seal/open primitives only (`kex_frame_*` +
-//! `pq_hybrid_session_key` + `PqTranscript` shapes). No `node.rs` wiring is
+//! `pq_session_key` + `PqTranscript` shapes). No `node.rs` wiring is
 //! touched here (sibling owns handshake/identity); the session keys below
 //! are derived exactly as `node.rs` derives them
-//! (`pq_hybrid_session_key(&classical, &shared, &digest)`), so the vectors
-//! transfer 1:1 to the wire path.
+//! (`pq_session_key(&shared, &digest)`), so the vectors transfer 1:1 to the
+//! wire path.
 //!
 //! Key rotation / epoch: the session key is fixed per connection
 //! (`stable_id -> [u8;32]`); re-key = reconnect (fresh ephemeral + fresh
@@ -55,13 +55,13 @@ const SHARED_B: [u8; 32] = [0xEEu8; 32];
 
 fn session_a() -> ([u8; 32], [u8; 32]) {
     let digest = transcript_a().digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_MLKEM768_HYBRID);
-    let key = proto::pq_hybrid_session_key(&CLASSICAL, &SHARED_A, &digest);
+    let key = proto::pq_session_key(&SHARED_A, &digest);
     (key, digest)
 }
 
 fn session_b() -> ([u8; 32], [u8; 32]) {
     let digest = transcript_b().digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_MLKEM768_HYBRID);
-    let key = proto::pq_hybrid_session_key(&CLASSICAL, &SHARED_B, &digest);
+    let key = proto::pq_session_key(&SHARED_B, &digest);
     (key, digest)
 }
 
@@ -192,29 +192,18 @@ fn pq_tampered_body_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Classical session unchanged: differential pre/post on fixed fixtures.
-//    New helpers are additive — these pins break if the classical path moves.
+// 3. KEM-only session vectors: deterministic KDF pin + unchanged frame auth.
+//    The classical X3DH KDFs are deleted; this pins the KEM-only replacement
+//    on the same fixed fixtures (same properties, KEM materials).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn classical_session_unchanged() {
-    // Pinned KDF vectors (same inputs as `pq_handshake_tests` classical pins).
-    let e2e = proto::e2e_key_from_shared(&[0x11u8; 32], &[1u8; 20], &[2u8; 20]);
+fn kem_session_vectors_and_frame_auth_unchanged() {
+    // Pinned KDF vector: blake3("infnode-pq-session-v1" || 0xDD*32 || 0xEE*32).
+    let k = proto::pq_session_key(&[0xDDu8; 32], &[0xEEu8; 32]);
     assert_eq!(
-        hex::encode(e2e),
-        "223572ada7ec7d5a660706223197bf472d691c5b848e5df0187e01b98751baeb"
-    );
-    let sess = proto::session_key(
-        &[0x11u8; 32],
-        &[0x22u8; 32],
-        &[0x33u8; 32],
-        &[0x44u8; 32],
-        &[1u8; 20],
-        &[2u8; 20],
-    );
-    assert_eq!(
-        hex::encode(sess),
-        "4e6ad0085408c0a66a43ad427f6865d0ea4efc462fbf9707c1af9597627cee5a"
+        hex::encode(k),
+        "f30ff66edf2b9ae8703eda331622c43f37ee768b8dd26750ba42111955d08818"
     );
     // Pinned classical wire bytes: kind=REQ seq=7 ts=1700000000000
     // src=01*20 dst=02*20 svc=0 payload="ping" nonce=8x00 sig=64x00.

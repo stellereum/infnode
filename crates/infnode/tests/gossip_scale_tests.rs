@@ -31,14 +31,13 @@
 
 use ed25519_dalek::SigningKey;
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, PeerLink};
 use infnode::{proto, reputation::RepConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 /// Harness scale: full mesh of this many nodes per test. Starting point 12;
 /// bump only while the whole suite stays green well under 300 s.
@@ -60,24 +59,33 @@ fn det_keys(label: &str) -> NodeKeys {
     let ed_bytes: [u8; 32] = *ed_seed.as_bytes();
     let signing = SigningKey::from_bytes(&ed_bytes);
     let verifying = signing.verifying_key();
-    let x_seed = blake3::hash(format!("{label}/x").as_bytes());
-    let e2e_sec = StaticSecret::from(*x_seed.as_bytes());
-    let e2e_pub = XPublicKey::from(&e2e_sec);
+    let k1 = blake3::hash(format!("{label}/kem1").as_bytes());
+    let k2 = blake3::hash(format!("{label}/kem2").as_bytes());
+    let mut kem_seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
+    kem_seed[..32].copy_from_slice(k1.as_bytes());
+    kem_seed[32..].copy_from_slice(k2.as_bytes());
+    let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
     NodeKeys {
         signing,
         verifying,
-        e2e_sec,
-        e2e_pub,
+        kem_seed,
+        kem_ek,
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+/// Deterministic PQ identity from a label (same blake3-label idiom).
+fn det_pq(label: &str) -> PqKeys {
+    let seed = blake3::hash(format!("{label}/pq").as_bytes());
+    let mut b = [0u8; 32];
+    b.copy_from_slice(seed.as_bytes());
+    PqKeys::from_seed(b)
+}
+
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -150,17 +158,18 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
     std::fs::create_dir_all(&tmp).expect("tmpdir");
 
     let keys: Vec<NodeKeys> = (0..n).map(|i| det_keys(&format!("gossip-scale/{tag}/{i}"))).collect();
+    let pqs: Vec<PqKeys> = (0..n).map(|i| det_pq(&format!("gossip-scale/{tag}/{i}"))).collect();
     let listens: Vec<String> = (0..n).map(|i| format!("127.0.0.1:{}", base_port + i as u16)).collect();
 
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
         let peers: Vec<PeerConfig> = (0..n)
             .filter(|&j| j != i)
-            .map(|j| peer_of(&format!("n{j}"), &keys[j], &listens[j]))
+            .map(|j| peer_of(&format!("n{j}"), &keys[j], &pqs[j], &listens[j]))
             .collect();
         let node = Node::new(
             cfg(&format!("{tag}-{i}"), &listens[i], peers),
-            keys[i].clone(),
+            keys[i].clone(), pqs[i].clone(),
             tmp.join(format!("n{i}")),
             PathBuf::new(),
         )
@@ -168,7 +177,7 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
         .unwrap_or_else(|e| panic!("{tag} node {i}: {e}"));
         nodes.push(node);
     }
-    let ids: Vec<[u8; 20]> = keys.iter().map(|k| k.id()).collect();
+    let ids: Vec<[u8; 20]> = pqs.iter().map(|pq| pq.pq_id()).collect();
 
     let mut handles = Vec::with_capacity(n);
     for node in &nodes {

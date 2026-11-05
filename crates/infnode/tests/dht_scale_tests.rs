@@ -17,34 +17,49 @@
 use ed25519_dalek::SigningKey;
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::dht;
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use infnode::proto;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 // ---------------------------------------------------------------------------
 // Deterministic helpers (same idiom as gossip_scale_tests.rs).
 // ---------------------------------------------------------------------------
 
 /// Deterministic node keys from a label (no OsRng in topology/keys).
+/// FULL-PQ: `NodeKeys` holds ed (frozen auth/TLS pin) + deterministic KEM
+/// seed (mailbox E2E, not routing); PQ identity is separate via `det_pq`
+/// (same blake3-label idiom, `PqKeys::from_seed` — existing helper).
 fn det_keys(label: &str) -> NodeKeys {
     let ed_seed = blake3::hash(format!("{label}/ed").as_bytes());
     let ed_bytes: [u8; 32] = *ed_seed.as_bytes();
     let signing = SigningKey::from_bytes(&ed_bytes);
     let verifying = signing.verifying_key();
-    let x_seed = blake3::hash(format!("{label}/x").as_bytes());
-    let e2e_sec = StaticSecret::from(*x_seed.as_bytes());
-    let e2e_pub = XPublicKey::from(&e2e_sec);
+    // Deterministic KEM seed (64 bytes via two blake3 domain hashes, no OsRng).
+    let k1 = blake3::hash(format!("{label}/kem1").as_bytes());
+    let k2 = blake3::hash(format!("{label}/kem2").as_bytes());
+    let mut kem_seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
+    kem_seed[..32].copy_from_slice(k1.as_bytes());
+    kem_seed[32..].copy_from_slice(k2.as_bytes());
+    let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
     NodeKeys {
         signing,
         verifying,
-        e2e_sec,
-        e2e_pub,
+        kem_seed,
+        kem_ek,
     }
+}
+
+/// Deterministic PQ identity from a label (same blake3-label idiom as
+/// `det_keys`, `PqKeys::from_seed` — existing helper, no new crypto).
+fn det_pq(label: &str) -> PqKeys {
+    let seed = blake3::hash(format!("{label}/pq").as_bytes());
+    let mut b = [0u8; 32];
+    b.copy_from_slice(seed.as_bytes());
+    PqKeys::from_seed(b)
 }
 
 fn fixture_id(label: &str) -> [u8; 20] {
@@ -54,13 +69,11 @@ fn fixture_id(label: &str) -> [u8; 20] {
     id
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -103,7 +116,7 @@ fn node_info(label: &str, last_seen: i64) -> dht::NodeInfo {
         id: fixture_id(label),
         endpoints: vec!["127.0.0.1:1".to_string()],
         ed_hex: String::new(),
-        x_hex: String::new(),
+        pq_hex: String::new(),
         last_seen,
     }
 }
@@ -135,21 +148,23 @@ async fn dht_ops_scale_table_n10_15_20() {
     let tmp = tmpdir("ops");
     for n in [10usize, 15, 20] {
         let keys: Vec<NodeKeys> = (0..n).map(|i| det_keys(&format!("dhtscale-ops/{n}/{i}"))).collect();
+        let pqs: Vec<PqKeys> = (0..n).map(|i| det_pq(&format!("dhtscale-ops/{n}/{i}"))).collect();
         let node = Node::new(
             cfg(&format!("ops-{n}"), "127.0.0.1:0", vec![]),
-            keys[0].clone(),
+            keys[0].clone(), pqs[0].clone(),
             tmp.join(format!("n{n}")),
             PathBuf::new(),
         )
         .await
         .expect("node");
-        // Populate routing via the REAL validated path (ed must derive id).
-        for (i, k) in keys.iter().enumerate().skip(1) {
+        // Populate routing via the REAL validated path (FULL-PQ: pq must
+        // derive id via `node_info_valid`, same fail-closed gate).
+        for (i, (k, pq)) in keys.iter().zip(pqs.iter()).enumerate().skip(1) {
             node.ensure_dht_peer(&dht::NodeInfo {
-                id: k.id(),
+                id: pq.pq_id(),
                 endpoints: vec!["127.0.0.1:1".to_string()],
                 ed_hex: hex::encode(k.verifying.to_bytes()),
-                x_hex: hex::encode(k.e2e_pub.as_bytes()),
+                pq_hex: pq.pq_pub_hex(),
                 last_seen: dht::now_ms(),
             })
             .await
@@ -179,7 +194,7 @@ async fn dht_ops_scale_table_n10_15_20() {
         let mut kv = dht::KvStore::default();
         let t0 = std::time::Instant::now();
         for i in 0..n {
-            kv.store(&format!("scale:{n}:k:{i}"), "v".into(), 3_600_000, keys[0].id());
+            kv.store(&format!("scale:{n}:k:{i}"), "v".into(), 3_600_000, pqs[0].pq_id());
         }
         // Repair-candidate scan input: half-aged replicas + one dedup hint.
         let now = dht::now_ms();
@@ -188,11 +203,11 @@ async fn dht_ops_scale_table_n10_15_20() {
                 &format!("scale:{n}:r:{i}"),
                 "v".into(),
                 600_000,
-                keys[0].id(),
+                pqs[0].pq_id(),
                 now - 450_000,
             );
         }
-        kv.store("dedup:scale:hint", "{\"nodes\":[]}".into(), dht::DEDUP_TTL_MS, keys[0].id());
+        kv.store("dedup:scale:hint", "{\"nodes\":[]}".into(), dht::DEDUP_TTL_MS, pqs[0].pq_id());
         let t0store = t0.elapsed();
         let t1 = std::time::Instant::now();
         for i in 0..n {
@@ -240,20 +255,22 @@ async fn dht_ops_scale_table_n10_15_20() {
 async fn dht_store_find_value_loopback_rtt() {
     let tmp = tmpdir("rtt");
     let ka = det_keys("dhtscale-rtt/a");
+    let pa = det_pq("dhtscale-rtt/a");
     let kb = det_keys("dhtscale-rtt/b");
+    let pb = det_pq("dhtscale-rtt/b");
     let la = "127.0.0.1:19350";
     let lb = "127.0.0.1:19351";
     let a = Node::new(
-        cfg("RTT-A", la, vec![peer_of("B", &kb, lb)]),
-        ka.clone(),
+        cfg("RTT-A", la, vec![peer_of("B", &kb, &pb, lb)]),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("A");
     let b = Node::new(
-        cfg("RTT-B", lb, vec![peer_of("A", &ka, la)]),
-        kb.clone(),
+        cfg("RTT-B", lb, vec![peer_of("A", &ka, &pa, la)]),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -267,14 +284,14 @@ async fn dht_store_find_value_loopback_rtt() {
         let n = b.clone();
         async move { n.serve().await }
     });
-    wait_ping(&a, kb.id()).await;
+    wait_ping(&a, pb.pq_id()).await;
 
     let key = "scale:loop:key";
     let p = serde_json::json!({ "key": key, "value": "v-loop", "ttl": 3600 })
         .to_string()
         .into_bytes();
     let t0 = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(kb.id(), "dht.store", p))
+    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(pb.pq_id(), "dht.store", p))
         .await
         .expect("no hang")
         .expect("transport ok");
@@ -283,7 +300,7 @@ async fn dht_store_find_value_loopback_rtt() {
 
     let p = serde_json::json!({ "key": key }).to_string().into_bytes();
     let t0 = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(kb.id(), "dht.find_value", p))
+    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(pb.pq_id(), "dht.find_value", p))
         .await
         .expect("no hang")
         .expect("transport ok");
@@ -357,7 +374,7 @@ async fn routing_prune_stale_before_after() {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
             ed_hex: String::new(),
-            x_hex: String::new(),
+            pq_hex: String::new(),
             last_seen: now,
         });
     }
@@ -371,7 +388,7 @@ async fn routing_prune_stale_before_after() {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
             ed_hex: String::new(),
-            x_hex: String::new(),
+            pq_hex: String::new(),
             last_seen: now - dht::ROUTING_STALE_AFTER_MS - 3_600_000,
         });
     }
@@ -429,20 +446,21 @@ async fn pubsub_fanout_loopback_dup_rate() {
     let topic = "scale-fanout";
     let keys: Vec<NodeKeys> =
         (0..3).map(|i| det_keys(&format!("dhtscale-fanout/{i}"))).collect();
+    let pqs: Vec<PqKeys> = (0..3).map(|i| det_pq(&format!("dhtscale-fanout/{i}"))).collect();
     let listens = ["127.0.0.1:19360", "127.0.0.1:19361", "127.0.0.1:19362"];
     let mut nodes = Vec::new();
     for i in 0..3 {
         let peers: Vec<PeerConfig> = (0..3)
             .filter(|&j| j != i)
-            .map(|j| peer_of(&format!("n{j}"), &keys[j], listens[j]))
+            .map(|j| peer_of(&format!("n{j}"), &keys[j], &pqs[j], listens[j]))
             .collect();
         nodes.push(
-            Node::new(cfg(&format!("fanout-{i}"), listens[i], peers), keys[i].clone(), tmp.join(format!("n{i}")), PathBuf::new())
+            Node::new(cfg(&format!("fanout-{i}"), listens[i], peers), keys[i].clone(), pqs[i].clone(), tmp.join(format!("n{i}")), PathBuf::new())
                 .await
                 .expect("node"),
         );
     }
-    let ids: Vec<[u8; 20]> = keys.iter().map(|k| k.id()).collect();
+    let ids: Vec<[u8; 20]> = pqs.iter().map(|pq| pq.pq_id()).collect();
     let mut handles = Vec::new();
     for n in &nodes {
         let c = n.clone();

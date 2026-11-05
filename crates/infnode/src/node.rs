@@ -183,11 +183,20 @@ pub struct PeerLink {
     pub rate: Arc<Mutex<RateBucket>>,
 }
 
-/// Запись маршрута для discovery.
+/// Запись маршрута для discovery (FULL-PQ: `ed_hex` is the frozen
+/// auth/TLS pin (NOT identity); PQ identity is the map key `pid` which MUST
+/// equal `pq_id_from_pub` of the pinned `pq_pub` — enforced at
+/// `PeerConfig::primary_id` / `dht::node_info_valid`, not here. Gossip
+/// poisoning is still fail-closed via `ed_hex` MITM check + `pq_hex`
+/// binding below).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Route {
     pub endpoints: Vec<String>,
     pub ed_hex: String,
+    /// Pinned PQ key hex (empty = unknown/classical-explicit, never trusted
+    /// for identity; validated to derive `pid` when present).
+    #[serde(default)]
+    pub pq_hex: String,
 }
 
 /// Подписка узла на топик: время + текущие живые соединения (может быть несколько).
@@ -395,6 +404,7 @@ struct QueuedMsg {
 pub struct Node {
     pub cfg: NodeConfig,
     pub keys: NodeKeys,
+    pub pq: PqKeys,
     pub id: [u8; NODEID_LEN],
     pub id_hex: String,
     pub peers: RwLock<HashMap<[u8; NODEID_LEN], PeerLink>>,
@@ -510,6 +520,11 @@ pub struct Node {
     /// identity across IPs and never hit well-behaved peers sharing an
     /// address. See `crate::reputation` for the score model.
     peer_rep: Mutex<HashMap<[u8; NODEID_LEN], RepEntry>>,
+    /// LONG-TERM PQ peer-key verdict cache (perf, safety-first): static
+    /// Falcon-512 parse only, keyed by key bytes. Guard is `std` (never held
+    /// across await — `check` is pure CPU). Exact invalidation on rotation /
+    /// registry change; see `FalconPeerKeyCache`.
+    falcon_peer_key_cache: std::sync::Mutex<FalconPeerKeyCache>,
 }
 
 /// R6: гейт на КАЖДЫЙ персистимый файл. Держится только на время
@@ -624,23 +639,23 @@ impl Node {
     pub async fn new(
         cfg: NodeConfig,
         keys: NodeKeys,
+        pq: PqKeys,
         data_dir: PathBuf,
         config_path: PathBuf,
     ) -> Result<Arc<Self>> {
-        let id = keys.id();
-        let id_hex = keys.id_hex();
-        // Re-ceremony mark: `Node::new` is classical-only today (no `PqKeys`
-        // param — signature frozen; startup PQ enrolment via
-        // `keyring::PqKeys::load_or_generate` is a follow-up outside this
-        // change's zone). The local id is therefore the LEGACY alias —
-        // say so in the log, never silently classical.
+        // FULL-PQ: local NodeId is PQ-only (`ceremony_local_id` /
+        // `keyring::resolve_node_id` — same construction as
+        // `PeerConfig::primary_id`, no duplicate logic).
+        let id = crate::node::ceremony_local_id(&keys, &pq);
+        let id_hex = format!("inf1:{}", hex::encode(id));
+        // `node_id_kind` telemetry now only knows `PQ`.
         crate::log::emit(
             2,
             "info",
             &cfg.name,
             0,
             "node_id_kind",
-            json!({ "kind": crate::keyring::NodeIdKind::Legacy.label(), "id": id_hex }),
+            json!({ "kind": crate::keyring::NodeIdKind::Pq.label(), "id": id_hex }),
         );
         let client_bind = cfg
             .client_listen
@@ -665,7 +680,9 @@ impl Node {
             let mut p = p.clone();
             // RBAC: раскрываем роль в allow
             p.allow = p.effective_allow(roles);
-            let pid = p.node_id_raw()?;
+            // FULL-PQ: peer identity is PQ-only (`primary_id` — same
+            // `pq_id_from_pub` construction as local `ceremony_local_id`).
+            let pid = p.primary_id()?;
             let ed = p.ed_bytes()?;
             let rc = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
@@ -697,6 +714,7 @@ impl Node {
             routes.entry(pid).or_insert(Route {
                 endpoints: p.endpoints.clone(),
                 ed_hex: p.ed_pub.clone(),
+                pq_hex: p.pq_pub.clone().unwrap_or_default(),
             });
         }
         let mail_dir = std::env::var("INFNODE_MAIL_DIR")
@@ -738,6 +756,7 @@ impl Node {
         let node = Arc::new(Node {
             cfg,
             keys,
+            pq,
             id,
             id_hex,
             peers: RwLock::new(peers),
@@ -789,6 +808,7 @@ impl Node {
             auth_failures: Mutex::new(HashMap::new()),
             auth_bans: Mutex::new(HashMap::new()),
             peer_rep: Mutex::new(HashMap::new()),
+            falcon_peer_key_cache: std::sync::Mutex::new(FalconPeerKeyCache::new()),
         });
         node.load_persistent().await;
         node.load_routing().await;
@@ -1496,7 +1516,7 @@ impl Node {
     }
 
     async fn connect_with_auth(&self, peer: &PeerLink, addr: SocketAddr) -> Result<Connection> {
-        let pid = peer.cfg.node_id_raw()?;
+        let pid = peer.cfg.primary_id()?;
         let connecting =
             self.client_ep
                 .connect_with(peer.client_cfg.clone(), addr, &peer.cfg.name)?;
@@ -1504,7 +1524,9 @@ impl Node {
             .await
             .map_err(|_| anyhow!("handshake timeout"))??;
 
-        // forward secrecy: свежий эфемерный X25519 на каждое соединение
+        // Freshness: свежий эфемерный X25519 на каждое соединение (только
+        // привязка транскрипта; ECDH нет — forward secrecy даёт свежий
+        // эфемерный ML-KEM encap на каждое соединение).
         let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
         let eph_pub = XPub::from(&eph_sec);
         // PQ handshake offer (default-ON since PQ 9.1; explicit opt-out
@@ -1522,7 +1544,6 @@ impl Node {
                 "at": now_ms(),
                 "eph": hex::encode(eph_pub.as_bytes()),
                 "ed": hex::encode(self.keys.verifying.as_bytes()),
-                "x": hex::encode(self.keys.e2e_pub.as_bytes()),
                 "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
                 "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
                 "pq_ek": hex::encode(&offer.ek),
@@ -1535,7 +1556,6 @@ impl Node {
                 "at": now_ms(),
                 "eph": hex::encode(eph_pub.as_bytes()),
                 "ed": hex::encode(self.keys.verifying.as_bytes()),
-                "x": hex::encode(self.keys.e2e_pub.as_bytes()),
             })
             .to_string()
             .into_bytes()
@@ -1609,12 +1629,13 @@ impl Node {
             // classical: pre-H window fallback — loud, counted, explicit.
             proto::pq_warn_classical_fallback("dial");
         }
-        // forward secrecy: сессионный ключ из static+эфемерных ECDH
-        let classical = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
-        // PQ-hybrid: breaks only if BOTH classical X3DH and ML-KEM break.
+        // KEM-only session: the key derives SOLELY from the ML-KEM shared
+        // secret + transcript digest (X3DH leg cut). No PQ agreement (opted
+        // out or classical responder) is fail-closed: without a KEM secret
+        // there is no session key (the WARN above already fired).
         let key = match &pq_agreed {
-            Some(a) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
-            None => classical,
+            Some(a) => proto::pq_session_key(&a.shared, &a.digest),
+            None => bail!("pq handshake required (X3DH session KEX removed)"),
         };
         // Backpressure: fail-closed when the session table is full (the dial
         // fails here instead of growing memory without bound).
@@ -1635,8 +1656,13 @@ impl Node {
         }
         self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
             .await;
-        self.routing_insert(pid, &peer.cfg.endpoints, &peer.cfg.ed_pub, &peer.cfg.x_pub)
-            .await;
+        self.routing_insert(
+            pid,
+            &peer.cfg.endpoints,
+            &peer.cfg.ed_pub,
+            peer.cfg.pq_pub.as_deref().unwrap_or(""),
+        )
+        .await;
         // No replay reset needed: the anti-replay window is per CONNECTION now
         // (`ConnReplayWindow`, created lazily by `replay_window`), so a new
         // connection starts with an empty window and cannot inherit a sequence
@@ -2680,6 +2706,7 @@ impl Node {
             let route = routes.entry(pid).or_insert(Route {
                 endpoints: Vec::new(),
                 ed_hex: ed_hex.to_string(),
+                pq_hex: String::new(),
             });
             if !route.endpoints.contains(&endpoint) {
                 route.endpoints.push(endpoint);
@@ -2715,6 +2742,20 @@ impl Node {
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rc))?;
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
         client_cfg.transport_config(Arc::new(transport_config()));
+        // EXACT invalidation on key rotation: if this pid already pins a
+        // DIFFERENT long-term PQ key, drop the old verdict so the next
+        // handshake re-verifies fresh (never a stale hit).
+        if let Some(old) = self.peers.read().await.get(&pid) {
+            let old_pq = old.cfg.pq_bytes().unwrap_or(None);
+            let new_pq = pcfg.pq_bytes().unwrap_or(None);
+            if old_pq != new_pq {
+                if let Some(was) = old_pq {
+                    if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
+                        cache.invalidate(&was);
+                    }
+                }
+            }
+        }
         let link = PeerLink {
             cfg: pcfg,
             conn: Arc::new(RwLock::new(None)),
@@ -3582,7 +3623,7 @@ impl Node {
         let known = self.routes.read().await.get(&target).cloned();
         if let Some(route) = known {
             return Some(
-                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": route.endpoints, "ed_pub": route.ed_hex, "via": self.id_hex })
+                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": route.endpoints, "ed_pub": route.ed_hex, "pq_pub": route.pq_hex, "via": self.id_hex })
                     .to_string()
                     .into_bytes(),
             );
@@ -3608,6 +3649,7 @@ impl Node {
             .into_bytes();
         let mut merged: Vec<String> = Vec::new();
         let mut found_ed: Option<String> = None;
+        let mut found_pq: Option<String> = None;
         let mut handles = Vec::new();
         for pid in peers {
             let node = self.clone();
@@ -3630,6 +3672,9 @@ impl Node {
                         if let Some(ed) = rv["ed_pub"].as_str() {
                             found_ed = Some(ed.to_string());
                         }
+                        if let Some(pq) = rv["pq_pub"].as_str() {
+                            found_pq = Some(pq.to_string());
+                        }
                     }
                 }
             }
@@ -3644,7 +3689,7 @@ impl Node {
             )
         } else {
             Some(
-                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": merged, "ed_pub": found_ed, "via": self.id_hex })
+                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": merged, "ed_pub": found_ed, "pq_pub": found_pq, "via": self.id_hex })
                     .to_string()
                     .into_bytes(),
             )
@@ -3678,17 +3723,26 @@ impl Node {
                         continue;
                     }
                     let ed_hex = rv["ed_pub"].as_str().unwrap_or("").to_string();
-                    // Отравление таблицы: запись с чужим/битым ключом
-                    // пропускается (иначе честный node_id привязывался к ключу
-                    // атакующего и discovery уводил к нему).
+                    let pq_hex = rv["pq_pub"].as_str().unwrap_or("").to_string();
+                    // Отравление таблицы (FULL-PQ): PQ pin MUST derive `pid`
+                    // (fail-closed, no empty-unknown merge — otherwise anyone
+                    // could bind an honest PQ id to attacker endpoints).
+                    // `ed_hex` — frozen auth-pin (проверяется отдельно
+                    // в handshake/TLS, здесь только сохраняется для MITM).
+                    let Ok(pq) = hex::decode(&pq_hex) else {
+                        continue;
+                    };
+                    if pq.len() != crate::proto::PQ_FALCON_PK_LEN {
+                        continue;
+                    }
+                    if crate::proto::pq_id_from_pub(&pq) != pid {
+                        continue;
+                    }
                     if !ed_hex.is_empty() {
                         let Ok(ed) = hex::decode(&ed_hex) else {
                             continue;
                         };
                         if ed.len() != 32 {
-                            continue;
-                        }
-                        if blake3::hash(&ed).as_bytes()[..NODEID_LEN] != pid[..] {
                             continue;
                         }
                     }
@@ -3706,6 +3760,7 @@ impl Node {
                     let route = Route {
                         endpoints,
                         ed_hex,
+                        pq_hex,
                     };
                     let entry = mine.entry(pid).or_insert_with(|| route.clone());
                     for e in &route.endpoints {
@@ -3719,6 +3774,10 @@ impl Node {
                     }
                     if entry.ed_hex.is_empty() {
                         entry.ed_hex = route.ed_hex.clone();
+                        changed = true;
+                    }
+                    if entry.pq_hex.is_empty() && !route.pq_hex.is_empty() {
+                        entry.pq_hex = route.pq_hex.clone();
                         changed = true;
                     }
                 }
@@ -4034,19 +4093,21 @@ impl Node {
     }
 
     /// Вставка/обновление узла в routing table + персистентность.
+    /// FULL-PQ: `ed_hex` is the frozen auth/TLS pin, `pq_hex` is the pinned
+    /// Falcon-512 key that must derive `pid` (see `dht::node_info_valid`).
     async fn routing_insert(
         &self,
         pid: [u8; NODEID_LEN],
         endpoints: &[String],
         ed_hex: &str,
-        x_hex: &str,
+        pq_hex: &str,
     ) {
         let mut routing = self.routing.write().await;
         routing.insert(crate::dht::NodeInfo {
             id: pid,
             endpoints: endpoints.to_vec(),
             ed_hex: ed_hex.to_string(),
-            x_hex: x_hex.to_string(),
+            pq_hex: pq_hex.to_string(),
             last_seen: crate::dht::now_ms(),
         });
         drop(routing);
@@ -4087,7 +4148,8 @@ impl Node {
         // Fail-closed: запись из чужой таблицы маршрутов проверяется ДО
         // создания PeerLink — иначе отравленная запись давала pin на ключ
         // атакующего вместе с dial-бюджетом под его управлением.
-        if !crate::dht::node_info_valid(&info.id, &info.ed_hex, &info.x_hex, &info.endpoints) {
+        // FULL-PQ: `id` MUST be the PQ id derived from the pinned `pq_hex`.
+        if !crate::dht::node_info_valid(&info.id, &info.ed_hex, &info.pq_hex, &info.endpoints) {
             bail!("invalid dht node info");
         }
         let endpoints: Vec<String> = info
@@ -4099,12 +4161,9 @@ impl Node {
             .collect();
         let pcfg = PeerConfig {
             name: format!("dht-{}", hex::encode(&info.id[..4])),
-            node_id: format!("inf1:{}", hex::encode(info.id)),
             ed_pub: info.ed_hex.clone(),
-            x_pub: info.x_hex.clone(),
-            // DHT-discovered peers are classical by construction (explicit):
-            // PQ binding happens only via pinned pq_pub + verified tag.
-            pq_pub: None,
+            // DHT-discovered PQ pin (validated above to derive `info.id`).
+            pq_pub: Some(info.pq_hex.clone()),
             endpoints: endpoints.clone(),
             // DHT-обнаруженные ноды: только discovery (lookup/update/find_node).
             // БЕЗ dht.store (запись фейковых манифестов/реестра), dht.sync (слепок KV),
@@ -4122,9 +4181,70 @@ impl Node {
             storage_roles: vec![],
         };
         self.add_dynamic_peer(info.id, pcfg).await?;
-        self.routing_insert(info.id, &endpoints, &info.ed_hex, &info.x_hex)
+        self.routing_insert(info.id, &info.endpoints, &info.ed_hex, &info.pq_hex)
             .await;
         Ok(())
+    }
+
+    /// DNS-seed candidate registration (FULL-PQ).
+    ///
+    /// A DNS TXT record pins `ed` plus the KEM-ek hash only, never a
+    /// Falcon-512 key, so a DNS candidate can NOT enter DHT routing
+    /// (`ensure_dht_peer` requires a validated pq pin deriving the id,
+    /// fail-closed). Instead the candidate is registered as a dialable
+    /// dynamic peer in the TOFU-precedent shape (ed-pinned, no PQ pin yet,
+    /// least-privilege ACL, rate-limited): the existing `reconnect_loop`
+    /// sweep dials it, the handshake authenticates via the ed pin (frozen
+    /// policy) and negotiates a KEM-only session through the ephemeral PQ
+    /// offer; the peer's real PQ key is learned over that authenticated
+    /// channel afterwards, never from DNS.
+    ///
+    /// Returns the peers-map key (ed-derived, TOFU precedent, NOT a NodeId).
+    /// Idempotent: re-registering a known candidate is a no-op Ok.
+    pub async fn register_dns_candidate(
+        &self,
+        ed_hex: &str,
+        endpoints: Vec<String>,
+    ) -> Result<[u8; NODEID_LEN]> {
+        let ed: [u8; 32] = hex::decode(ed_hex.trim())
+            .map_err(|_| anyhow!("dns candidate ed must be 32 bytes hex"))?
+            .try_into()
+            .map_err(|_| anyhow!("dns candidate ed must be 32 bytes hex"))?;
+        let h = blake3::hash(&ed);
+        let mut pid = [0u8; NODEID_LEN];
+        pid.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
+        // Never ourselves (DNS ids are ed-derived; the local id is PQ — so
+        // compare the key, not the id).
+        if ed == *self.keys.verifying.as_bytes() {
+            bail!("dns candidate is self");
+        }
+        if self.peers.read().await.contains_key(&pid) {
+            return Ok(pid);
+        }
+        let endpoints: Vec<String> = endpoints
+            .into_iter()
+            .filter(|e| crate::dht::endpoint_ok(e))
+            .take(crate::proto::MAX_ENDPOINTS_PER_NODE)
+            .collect();
+        if endpoints.is_empty() {
+            bail!("dns candidate has no dialable endpoints");
+        }
+        // TOFU-precedent trust: DNS pins the key (stronger than TOFU's
+        // nothing) but the data plane stays least-privilege until the
+        // operator promotes the peer — same ACL source as TOFU, same
+        // born-rate-limited rule (PENTEST F5).
+        let pcfg = PeerConfig {
+            name: format!("dns-{}", hex::encode(&pid[..4])),
+            ed_pub: hex::encode(ed),
+            pq_pub: None,
+            endpoints,
+            allow: self.unknown_allow_cfg.read().await.clone(),
+            rate_limit_per_sec: DYNAMIC_PEER_RATE_LIMIT_PER_SEC,
+            role: None,
+            storage_roles: vec![],
+        };
+        self.add_dynamic_peer(pid, pcfg).await?;
+        Ok(pid)
     }
 
     /// Итеративный Kademlia lookup: k ближайших к target.
@@ -4144,7 +4264,7 @@ impl Node {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
                     ed_hex: p.cfg.ed_pub.clone(),
-                    x_hex: p.cfg.x_pub.clone(),
+                    pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 };
                 if !candidates.iter().any(|c| c.id == *pid) {
@@ -4257,7 +4377,7 @@ impl Node {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
                     ed_hex: p.cfg.ed_pub.clone(),
-                    x_hex: p.cfg.x_pub.clone(),
+                    pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 };
                 if !candidates.iter().any(|c| c.id == *pid) {
@@ -4294,7 +4414,7 @@ impl Node {
                     "node_id": format!("inf1:{}", hex::encode(n.id)),
                     "endpoints": n.endpoints,
                     "ed_pub": n.ed_hex,
-                    "x_pub": n.x_hex,
+                    "pq_pub": n.pq_hex,
                 })
             })
             .collect();
@@ -4490,7 +4610,7 @@ impl Node {
                     "node_id": format!("inf1:{}", hex::encode(n.id)),
                     "endpoints": n.endpoints,
                     "ed_pub": n.ed_hex,
-                    "x_pub": n.x_hex,
+                    "pq_pub": n.pq_hex,
                 })
             })
             .collect();
@@ -4882,7 +5002,7 @@ impl Node {
     }
 
     /// Все известные ноды сети (routing + конфигурированные пиры). Каждая запись содержит
-    /// id/endpoints/ed_pub/x_pub — это позволяет rewards начислять награду нодам, которые
+    /// id/endpoints/ed_pub/pq_pub — это позволяет rewards начислять награду нодам, которые
     /// прислали dht.update (автодобавление) без ручного внесения в конфиг валидатора.
     pub async fn known_peers(&self) -> Vec<crate::dht::NodeInfo> {
         let mut out: Vec<crate::dht::NodeInfo> = self.routing.read().await.all();
@@ -4894,7 +5014,7 @@ impl Node {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
                     ed_hex: p.cfg.ed_pub.clone(),
-                    x_hex: p.cfg.x_pub.clone(),
+                    pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 });
             }
@@ -6481,7 +6601,7 @@ impl Node {
             if let Some(p) = new_cfg
                 .peers
                 .iter()
-                .find(|p| p.node_id_raw().ok() == Some(*pid))
+                .find(|p| p.primary_id().ok() == Some(*pid))
             {
                 let mut p = p.clone();
                 p.allow = p.effective_allow(&roles);
@@ -6491,6 +6611,21 @@ impl Node {
                 }
                 link.cfg.rate_limit_per_sec = p.rate_limit_per_sec;
                 link.cfg.role = p.role;
+                // EXACT invalidation on registry change: a rotated pinned PQ
+                // key takes effect here (previously `pq_pub` was never
+                // reloaded, so rotation silently kept the stale pin) and the
+                // old verdict is dropped so the next handshake re-verifies
+                // fresh. Unchanged pins keep their cached verdict.
+                if link.cfg.pq_pub != p.pq_pub {
+                    if let Some(old_hex) = link.cfg.pq_pub.clone() {
+                        if let Ok(old) = hex::decode(&old_hex) {
+                            if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
+                                cache.invalidate(&old);
+                            }
+                        }
+                    }
+                    link.cfg.pq_pub = p.pq_pub;
+                }
                 updated += 1;
             }
         }
@@ -7164,7 +7299,7 @@ async fn handle_stream(
         // Строгий гейт payload (fail-closed): nonce/at/eph/ed/x обязаны быть
         // на месте и свежими. Раньше проверялись только подпись фрейма и его
         // ts — повтор кадра в окне ±10 мин создавал новую сессию.
-        let (ch_nonce, ch_eph, ch_ed, ch_x) = match challenge_fields(&ch) {
+        let (ch_nonce, ch_eph, ch_ed) = match challenge_fields(&ch) {
             Ok(v) => v,
             Err(e) => {
                 return Err(e);
@@ -7184,28 +7319,38 @@ async fn handle_stream(
                     bail!("peer disappeared");
                 }
             };
-            // Привязка payload к пинну: известный пир обязан предъявить СВОИ
-            // ключи, а не чужие валидные (раньше ed/x из payload игнорировались).
+            // Привязка payload к пинну: известный пир обязан предъявить СВОЙ
+            // ed-ключ (X3DH-нога вырезана — статическая x25519-привязка
+            // удалена; аутентификация — та же подпись ed25519).
             let pinned_ed = match peer.cfg.ed_bytes() {
                 Ok(b) => b,
                 Err(e) => {
                     return Err(e);
                 }
             };
-            let pinned_x = match peer.cfg.x_bytes() {
-                Ok(b) => b,
-                Err(e) => {
-                    return Err(e);
-                }
-            };
-            if ch_ed != pinned_ed || ch_x != pinned_x {
+            if ch_ed != pinned_ed {
                 bail!("challenge key mismatch");
+            }
+            // LONG-TERM PQ peer-key verify (cached static parse ONLY): a pinned
+            // `pq_pub` parses once per distinct key bytes; absent = classical
+            // (unchanged window behavior). Malformed pins refuse fail-closed.
+            // Per-handshake tag/transcript/freshness/KEM-ct checks below still
+            // run fresh every handshake — this cache never excuses them.
+            // KEM `pq_ek` is deliberately NOT cached: it is a fresh ephemeral
+            // per handshake (`pq_initiator_offer`), so byte-keyed reuse would
+            // never hit and only leak memory; `pq_responder_accept` validates
+            // it fresh every time (see perf note in `FalconPeerKeyCache` tests).
+            {
+                let mut cache = node
+                    .falcon_peer_key_cache
+                    .lock()
+                    .map_err(|_| anyhow!("pq peer-key cache poisoned"))?;
+                pq_pinned_key_check_cached(&mut cache, &peer.cfg)?;
             }
             peer
         } else if node.cfg.allow_unknown {
             // TOFU: неизвестная нода доказывает владение ключом подписью CHALLENGE
             let ed_hex = hex::encode(ch_ed);
-            let x_hex = hex::encode(ch_x);
             let ed: [u8; 32] = ch_ed;
             let vk = match VerifyingKey::from_bytes(&ed) {
                 Ok(v) => v,
@@ -7234,10 +7379,10 @@ async fn handle_stream(
             }
             let pcfg = PeerConfig {
                 name: format!("dyn-{}", hex::encode(&claimed[..4])),
-                node_id: format!("inf1:{}", hex::encode(claimed)),
                 ed_pub: ed_hex.clone(),
-                x_pub: x_hex,
-                // TOFU peers are classical by construction (explicit).
+                // TOFU: no pinned PQ (unknown) — `primary_id` refuses, but
+                // `pid` comes from the network `claimed` (PQ src), not from
+                // the config; PQ session still negotiates via ephemeral KEM.
                 pq_pub: None,
                 endpoints: vec![conn.remote_address().to_string()],
                 allow: node.unknown_allow_cfg.read().await.clone(),
@@ -7247,9 +7392,7 @@ async fn handle_stream(
                 role: None,
                 storage_roles: vec![],
             };
-            if let Err(e) = node.add_dynamic_peer(claimed, pcfg).await {
-                return Err(e);
-            }
+            node.add_dynamic_peer(claimed, pcfg).await?;
             // TOFU: показываем оператору отпечаток для ручной проверки (как SSH fingerprint)
             eprintln!(
                 "[{}] !! TOFU: unknown node inf1:{} ed={} from {} accepted — verify the fingerprint!",
@@ -7289,7 +7432,8 @@ async fn handle_stream(
                 bail!("challenge replay");
             }
         }
-        // forward secrecy: вычисляем сессионный ключ и отдаём свой эфемерный в AUTH
+        // KEM-only сессия: ключ — из ML-KEM секрета + дайджест транскрипта;
+        // свой эфемерный eph отдаём в AUTH для привязки транскрипта (не ECDH).
         let srv_eph = XSecret::random_from_rng(rand::rngs::OsRng);
         let srv_eph_pub = XPub::from(&srv_eph);
         let auth_at = now_ms();
@@ -7322,15 +7466,14 @@ async fn handle_stream(
             // pre-H window fallback — loud, counted, explicit.
             proto::pq_warn_classical_fallback("accept");
         }
-        let classical = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
-            Ok(k) => k,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        // KEM-only session (X3DH leg cut): sole inputs are the ML-KEM shared
+        // secret + transcript digest. No PQ offer (classical initiator) is
+        // fail-closed — the WARN above already fired.
         let key = match &pq_state {
-            Some((_, a)) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
-            None => classical,
+            Some((_, a)) => proto::pq_session_key(&a.shared, &a.digest),
+            None => {
+                return Err(anyhow!("pq handshake required (X3DH session KEX removed)"));
+            }
         };
         // Backpressure bound on the session table (fail-closed: when full the
         // session is NOT stored, so this conn can serve no requests; the auth
@@ -7348,7 +7491,7 @@ async fn handle_stream(
             claimed,
             &peer.cfg.endpoints,
             &peer.cfg.ed_pub,
-            &peer.cfg.x_pub,
+            peer.cfg.pq_pub.as_deref().unwrap_or(""),
         )
         .await;
         *peer.conn.write().await = Some(conn.clone());
@@ -7888,7 +8031,7 @@ fn salsa_decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow!("salsa decrypt failed"))
 }
 
-/// Proton-инкапсуляция произвольных бинарных данных (вложения): XSalsa20 + box на x_pub.
+/// Proton-инкапсуляция произвольных бинарных данных (вложения): XSalsa20 + box на KEM-ключ получателя.
 pub fn proton_box_data(owner_pub_hex: &str, data: &[u8]) -> Option<String> {
     let data_key = rand::random::<[u8; 32]>();
     let (ct, nonce) = salsa_encrypt(&data_key, data);
@@ -7905,7 +8048,7 @@ pub fn proton_box_data(owner_pub_hex: &str, data: &[u8]) -> Option<String> {
 }
 
 /// Proton-инкапсуляция текста: случайный ключ шифрует plain (XSalsa20-Poly1305 = NaCl secretbox,
-/// совместим с tweetnacl на фронте), ключ box-заворачивается на публичный X25519 получателя.
+/// совместим с tweetnacl на фронте), ключ box-заворачивается на ML-KEM-768 ключ получателя.
 /// Возвращает JSON-строку {"proto":"infmail-box-v1","key_box":{...},"nonce":hex,"ct":hex}.
 pub fn proton_box_body(owner_pub_hex: &str, plain: &str) -> Option<String> {
     if plain.is_empty() {
@@ -7931,7 +8074,7 @@ pub fn proton_box_body(owner_pub_hex: &str, plain: &str) -> Option<String> {
     )
 }
 
-/// Расшифровать proton_box_body JSON-строку приватным X25519-ключом. None если формат не тот.
+/// Расшифровать proton_box_body JSON-строку KEM-сидом владельца. None если формат не тот.
 pub fn proton_unbox_body(payload: &str, owner_priv_hex: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
     if v["proto"].as_str() != Some("infmail-box-v1") {
@@ -7948,45 +8091,76 @@ pub fn proton_unbox_body(payload: &str, owner_priv_hex: &str) -> Option<String> 
     String::from_utf8(dec).ok()
 }
 
-/// Box-шифрование 32-байтного ключа на публичный X25519-ключ получателя (Proton-модель).
-/// Использует эфемерный X25519 (ECDH) → общий секрет → XSalsa20-Poly1305. Расшифровать может
-/// только владелец приватного X25519-ключа (браузер). Сервер и ноды ключ блоба не видят.
-/// Возвращает json-значение { "eph": hex, "nonce": hex, "ct": hex }.
+/// Box-шифрование 32-байтного ключа на ML-KEM-768 ключ получателя.
+/// Encapsulate → общий секрет → XSalsa20-Poly1305. Расшифровать может
+/// только владелец KEM-сида (браузер). Сервер и ноды ключ блоба не видят.
+/// Возвращает json-значение { "ct": hex (1088), "nonce": hex, "ct2": hex }.
+/// FULL-PQ: X25519 ECDH удалён (wipe, no compat).
 pub fn box_wrap_key(owner_pub_hex: &str, data_key: &[u8; 32]) -> Option<serde_json::Value> {
-    let owner_pub_bytes = hex::decode(owner_pub_hex).ok()?;
-    if owner_pub_bytes.len() != 32 {
+    let owner_ek = hex::decode(owner_pub_hex).ok()?;
+    if owner_ek.len() != crate::mailbox::KEM_EK_LEN {
         return None;
     }
-    let owner_pub = XPub::from(<[u8; 32]>::try_from(&owner_pub_bytes[..]).ok()?);
-    let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = XPub::from(&eph_sec);
-    let shared = eph_sec.diffie_hellman(&owner_pub);
-    let (ct, nonce) = salsa_encrypt(shared.as_bytes(), data_key);
+    let (kem_ct, shared) = kem_encap_for_box(&owner_ek)?;
+    let (ct, nonce) = salsa_encrypt(&shared, data_key);
     Some(json!({
-        "eph": hex::encode(eph_pub.as_bytes()),
+        "ct": hex::encode(&kem_ct),
         "nonce": hex::encode(&nonce),
-        "ct": hex::encode(&ct),
+        "ct2": hex::encode(&ct),
     }))
 }
 
-/// Распаковать key_box: даёт data_key (32 байта), если есть приватный X25519-ключ владельца.
+/// KEM-encap helper for `box_wrap_key` (explicit randomness via OsRng,
+/// same idiom as `mailbox::seal`).
+fn kem_encap_for_box(recipient_ek: &[u8]) -> Option<(Vec<u8>, [u8; 32])> {
+    use rand::RngCore;
+    if recipient_ek.len() != crate::mailbox::KEM_EK_LEN {
+        return None;
+    }
+    let key = ml_kem::kem::Key::<ml_kem::EncapsulationKey768>::try_from(recipient_ek).ok()?;
+    let ek = ml_kem::EncapsulationKey768::new(&key).ok()?;
+    let mut m = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut m);
+    let (ct, ss) = ek.encapsulate_deterministic(&m.into());
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Some((ct.as_slice().to_vec(), shared))
+}
+
+/// KEM-decap helper for `box_unwrap_key`.
+fn kem_decap_for_box(kem_seed: &[u8; 64], ct: &[u8]) -> Option<[u8; 32]> {
+    use ml_kem::kem::FromSeed;
+    if ct.len() != crate::mailbox::KEM_CT_LEN {
+        return None;
+    }
+    let seed: ml_kem::Seed = (*kem_seed).into();
+    let (dk, _) = ml_kem::MlKem768::from_seed(&seed);
+    let kem_ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> = ct.try_into().ok()?;
+    use ml_kem::kem::Decapsulate;
+    let ss = dk.decapsulate(&kem_ct);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Some(shared)
+}
+
+/// Распаковать key_box: даёт data_key (32 байта), если есть KEM-сид владельца
+/// (64 байта hex). Legacy 32-байтные X25519 ключи отказаны (wipe).
 pub fn box_unwrap_key(key_box: &serde_json::Value, owner_priv_hex: &str) -> Result<[u8; 32]> {
     let priv_bytes = hex::decode(owner_priv_hex)?;
-    if priv_bytes.len() != 32 {
-        bail!("private key: invalid length");
+    if priv_bytes.len() != crate::mailbox::KEM_SEED_LEN {
+        bail!("private key: KEM seed must be 64 bytes (legacy x25519 refused)");
     }
-    let priv_key =
-        XSecret::from(<[u8; 32]>::try_from(&priv_bytes[..]).map_err(|_| anyhow!("priv key"))?);
-    let eph_pub_bytes = hex::decode(key_box["eph"].as_str().unwrap_or(""))?;
-    if eph_pub_bytes.len() != 32 {
-        bail!("eph key: invalid length");
+    let seed: [u8; 64] = priv_bytes.try_into().map_err(|_| anyhow!("priv key"))?;
+    // New framing (`ct` = 1088 kem_ct) with legacy `eph` fallback refused.
+    let kem_ct_hex = key_box.get("ct").and_then(|v| v.as_str()).unwrap_or("");
+    let kem_ct = hex::decode(kem_ct_hex)?;
+    if kem_ct.len() != crate::mailbox::KEM_CT_LEN {
+        bail!("kem ct: invalid length (legacy eph refused)");
     }
-    let eph_pub =
-        XPub::from(<[u8; 32]>::try_from(&eph_pub_bytes[..]).map_err(|_| anyhow!("eph pub"))?);
-    let shared = priv_key.diffie_hellman(&eph_pub);
+    let shared = kem_decap_for_box(&seed, &kem_ct).ok_or_else(|| anyhow!("kem decap"))?;
     let nonce = hex::decode(key_box["nonce"].as_str().unwrap_or(""))?;
-    let ct = hex::decode(key_box["ct"].as_str().unwrap_or(""))?;
-    let dec = salsa_decrypt(shared.as_bytes(), &nonce, &ct)?;
+    let ct = hex::decode(key_box["ct2"].as_str().unwrap_or(""))?;
+    let dec = salsa_decrypt(&shared, &nonce, &ct)?;
     let mut key = [0u8; 32];
     if dec.len() != 32 {
         bail!("key_box: invalid length");
@@ -8040,8 +8214,10 @@ fn load_or_create_mail_key(data_dir: &std::path::Path) -> [u8; 32] {
 /// Строгий разбор CHALLENGE-payload (fail-closed, audit 2026-11-01): все поля
 /// обязаны присутствовать и быть свежими. Раньше `nonce`/`at`/`eph` вообще не
 /// проверялись — повторяемый в пределах ±10 мин кадр создавал новую сессию.
-/// Parsed CHALLENGE payload: (nonce hex, eph pub, ed pub, x pub).
-type ChallengeFields = (String, [u8; 32], [u8; 32], [u8; 32]);
+/// FULL-PQ: статическое поле `x` (X25519) удалено (X3DH-нога вырезана);
+/// лишнее поле `x` от старых пиров игнорируется (не читается).
+/// Parsed CHALLENGE payload: (nonce hex, eph pub, ed pub).
+type ChallengeFields = (String, [u8; 32], [u8; 32]);
 
 fn challenge_fields(v: &serde_json::Value) -> Result<ChallengeFields> {
     let nonce = v["nonce"]
@@ -8058,68 +8234,13 @@ fn challenge_fields(v: &serde_json::Value) -> Result<ChallengeFields> {
     }
     let eph = hex_fixed_32(v["eph"].as_str(), "eph")?;
     let ed = hex_fixed_32(v["ed"].as_str(), "ed")?;
-    let x = hex_fixed_32(v["x"].as_str(), "x")?;
-    Ok((nonce.to_string(), eph, ed, x))
+    Ok((nonce.to_string(), eph, ed))
 }
 
 fn hex_fixed_32(s: Option<&str>, what: &str) -> Result<[u8; 32]> {
     let b = hex::decode(s.ok_or_else(|| anyhow!("challenge without {what}"))?)?;
     b.try_into()
         .map_err(|_| anyhow!("{what} is not 32 bytes"))
-}
-
-/// Сессионный ключ со стороны инициатора: eph_sec — наш эфемерный, peer_payload — AUTH (содержит eph пира).
-fn derive_session_key(
-    keys: &NodeKeys,
-    peer: &PeerConfig,
-    eph_sec: &XSecret,
-    peer_payload: &[u8],
-) -> Result<[u8; 32]> {
-    let v: serde_json::Value = serde_json::from_slice(peer_payload)?;
-    let peer_eph_hex = v["eph"]
-        .as_str()
-        .ok_or_else(|| anyhow!("AUTH without eph"))?;
-    let peer_eph_bytes: [u8; 32] = hex::decode(peer_eph_hex)?
-        .try_into()
-        .map_err(|_| anyhow!("eph is not 32 bytes"))?;
-    let peer_eph = XPub::from(peer_eph_bytes);
-    let peer_static = XPub::from(peer.x_bytes()?);
-    // X3DH: четыре симметричных секрета (обе стороны считают одинаковые значения)
-    let shared_w = *keys.e2e_sec.diffie_hellman(&peer_static).as_bytes(); // S_A x S_B
-    let shared_x = *keys.e2e_sec.diffie_hellman(&peer_eph).as_bytes(); // S_A x E_B
-    let shared_y = *eph_sec.diffie_hellman(&peer_static).as_bytes(); // E_A x S_B
-    let shared_z = *eph_sec.diffie_hellman(&peer_eph).as_bytes(); // E_A x E_B
-    let (lo, hi) = (&keys.id(), &peer.node_id_raw()?);
-    Ok(proto::session_key(
-        &shared_w, &shared_x, &shared_y, &shared_z, lo, hi,
-    ))
-}
-
-/// Сессионный ключ со стороны сервера (обработка CHALLENGE).
-fn derive_session_key_server(
-    keys: &NodeKeys,
-    peer: &PeerConfig,
-    srv_eph: &XSecret,
-    peer_payload: &[u8],
-) -> Result<[u8; 32]> {
-    let v: serde_json::Value = serde_json::from_slice(peer_payload)?;
-    let peer_eph_hex = v["eph"]
-        .as_str()
-        .ok_or_else(|| anyhow!("CHALLENGE without eph"))?;
-    let peer_eph_bytes: [u8; 32] = hex::decode(peer_eph_hex)?
-        .try_into()
-        .map_err(|_| anyhow!("eph is not 32 bytes"))?;
-    let peer_eph = XPub::from(peer_eph_bytes);
-    let peer_static = XPub::from(peer.x_bytes()?);
-    // X3DH с точки зрения сервера (B): те же значения, другой порядок операндов
-    let shared_w = *keys.e2e_sec.diffie_hellman(&peer_static).as_bytes(); // S_B x S_A
-    let shared_x = *srv_eph.diffie_hellman(&peer_static).as_bytes(); // E_B x S_A
-    let shared_y = *keys.e2e_sec.diffie_hellman(&peer_eph).as_bytes(); // S_B x E_A
-    let shared_z = *srv_eph.diffie_hellman(&peer_eph).as_bytes(); // E_B x E_A
-    let (lo, hi) = (&keys.id(), &peer.node_id_raw()?);
-    Ok(proto::session_key(
-        &shared_w, &shared_x, &shared_y, &shared_z, lo, hi,
-    ))
 }
 
 /// PQ HANDSHAKE helpers (default-ON since PQ 9.1 — same
@@ -8440,6 +8561,116 @@ impl PqIdentityRegistry {
     }
 }
 
+/// LONG-TERM PQ peer-key verification cache (perf, safety-first).
+///
+/// Caches ONLY the static check — "does this 897-byte Falcon-512 key parse
+/// as a well-formed public key?" — keyed by key bytes. Per-handshake checks
+/// (transcript digest, Falcon tag over the FRESH digest via
+/// `proto::pq_falcon_verify`, freshness/`ts_ok`, KEM ct/tag via
+/// `pq_responder_accept`/`pq_initiator_answer`) ALWAYS run fresh; this cache
+/// never short-circuits them.
+///
+/// Invalidation is EXACT:
+///
+/// * rotation (different key bytes) naturally misses (new bytes = new entry);
+/// * `invalidate` drops one entry when a pinned key rotates;
+/// * `clear` drops everything when the registry/config changes.
+///
+/// Fail-closed on cap: when full, verification still runs fresh (correct but
+/// uncached), never an accept, never an eviction of a valid entry.
+pub const MAX_FALCON_PEER_KEY_CACHE: usize = 1024;
+
+/// Verdict cache for distinct peer long-term Falcon-512 keys.
+#[derive(Default)]
+pub struct FalconPeerKeyCache {
+    entries: HashMap<Vec<u8>, bool>,
+}
+
+impl FalconPeerKeyCache {
+    /// Empty cache.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Cached entries (test/monitor hook).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when empty (test hook).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Cached verdict for these exact key bytes, if any.
+    pub fn get(&self, pk: &[u8]) -> Option<bool> {
+        self.entries.get(pk).copied()
+    }
+
+    /// Static long-term-key check, cached: true iff `pk` is exactly
+    /// [`proto::PQ_FALCON_PK_LEN`] bytes and parses as a Falcon-512 public
+    /// key. No digest/signature input — the per-handshake tag verify
+    /// (`proto::pq_falcon_verify`) must still run every handshake.
+    pub fn check(&mut self, pk: &[u8]) -> bool {
+        if let Some(v) = self.entries.get(pk) {
+            return *v;
+        }
+        let ok = falcon_peer_key_parse_ok(pk);
+        if self.entries.len() < MAX_FALCON_PEER_KEY_CACHE {
+            self.entries.insert(pk.to_vec(), ok);
+        }
+        ok
+    }
+
+    /// Exact invalidation for one rotated key: drops its entry so the next
+    /// handshake re-verifies fresh. Returns true when an entry was dropped.
+    pub fn invalidate(&mut self, pk: &[u8]) -> bool {
+        self.entries.remove(pk).is_some()
+    }
+
+    /// Exact invalidation for registry/config change: drops all entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Pure static parse: length + Falcon-512 `PublicKey::from_bytes`.
+/// Fail-closed: any malformed input is false (never an error, never a panic).
+pub fn falcon_peer_key_parse_ok(pk: &[u8]) -> bool {
+    if pk.len() != proto::PQ_FALCON_PK_LEN {
+        return false;
+    }
+    falcon_rust::falcon512::PublicKey::from_bytes(pk).is_ok()
+}
+
+/// Accept-path pinned-key gate using the verdict cache.
+///
+/// * `Ok(true)` — peer pins a PQ key and it parses (verdict possibly cached).
+/// * `Ok(false)` — peer pins nothing (`pq_pub = None`): classical-explicit,
+///   unchanged pre-H window behavior, no cache entry.
+/// * `Err` — pinned value present but malformed (bad hex/length via
+///   `pq_bytes`, or 897 bytes that are not a Falcon-512 point):
+///   fail-closed refuse.
+///
+/// Only the STATIC parse is cached. The per-handshake tag verify over the
+/// fresh digest (`proto::pq_falcon_verify`), transcript, freshness, and KEM
+/// ct/tag (`pq_responder_accept` / `pq_initiator_answer`) always run fresh.
+pub fn pq_pinned_key_check_cached(
+    cache: &mut FalconPeerKeyCache,
+    cfg: &PeerConfig,
+) -> Result<bool> {
+    let Some(pq) = cfg.pq_bytes()? else {
+        return Ok(false);
+    };
+    if cache.check(&pq) {
+        Ok(true)
+    } else {
+        bail!("pq peer key malformed")
+    }
+}
+
 /// Additive announce fields for CHALLENGE/AUTH JSON: `(pq_pub_hex,
 /// pq_id_hex, pq_sig_hex)` where `pq_sig` is the Falcon-512 tag over the
 /// finalized transcript digest by the long-term PQ key. The caller merges
@@ -8451,13 +8682,11 @@ pub fn pq_announce_fields(pq: &PqKeys, digest: &[u8; 32]) -> (String, String, St
     (pq.pq_pub_hex(), pq.pq_id_hex(), hex::encode(sig))
 }
 
-/// Canonical re-ceremony call site: PQ-primary `NodeId` derivation
+/// Canonical re-ceremony call site: PQ-only `NodeId` derivation
 /// (`keyring::resolve_node_id` — same construction, no duplicate logic).
-/// This is the one function new code calls to derive a local id; the
-/// pre-ceremony `keys.id()` call sites below stay byte-identical legacy
-/// until startup PQ enrolment lands (follow-up, out of this change's zone).
-pub fn ceremony_local_id(keys: &NodeKeys, pq: Option<&PqKeys>) -> [u8; NODEID_LEN] {
-    crate::keyring::resolve_node_id(keys, pq).id
+/// Requires a PQ identity (no classical fallback).
+pub fn ceremony_local_id(_keys: &NodeKeys, pq: &PqKeys) -> [u8; NODEID_LEN] {
+    crate::keyring::resolve_node_id(_keys, pq).id
 }
 
 /// Finalized transcript digest bytes the Falcon tag covers (same canonical
@@ -8477,8 +8706,10 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
     // Fail-closed: ответы find_node/find_value из сети проверяются тем же
     // гейтом, что ensure_dht_peer/dht.update (иначе отравленный ответ
     // привязывал честный node_id к ключу атакующего).
+    // FULL-PQ: wire carries `pq_pub` (Falcon-512, must derive `id`);
+    // `ed_pub` is the frozen auth/TLS pin (NOT identity).
     let ed_hex = v["ed_pub"].as_str().unwrap_or("").to_string();
-    let x_hex = v["x_pub"].as_str().unwrap_or("").to_string();
+    let pq_hex = v["pq_pub"].as_str().unwrap_or("").to_string();
     let endpoints: Vec<String> = v["endpoints"]
         .as_array()
         .map(|a| {
@@ -8490,14 +8721,14 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
                 .collect()
         })
         .unwrap_or_default();
-    if !crate::dht::node_info_valid(&id, &ed_hex, &x_hex, &endpoints) {
+    if !crate::dht::node_info_valid(&id, &ed_hex, &pq_hex, &endpoints) {
         return None;
     }
     Some(crate::dht::NodeInfo {
         id,
         endpoints,
         ed_hex,
-        x_hex,
+        pq_hex,
         last_seen: crate::dht::now_ms(),
     })
 }
@@ -8636,35 +8867,41 @@ impl ServerCertVerifier for PinnedVerifier {
 mod proton_tests {
     use super::*;
 
+    fn test_kem_pair() -> ([u8; 64], Vec<u8>) {
+        use rand::RngCore;
+        let mut seed = [0u8; 64];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        let ek = crate::mailbox::kem_ek_from_seed(&seed);
+        (seed, ek)
+    }
+
     #[test]
     fn proton_box_body_roundtrip() {
-        // владелец: X25519 ключ пара
-        let owner_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-        let owner_pub = XPub::from(&owner_sec);
+        // владелец: ML-KEM-768 пара
+        let (seed, ek) = test_kem_pair();
         let plain = "Hello, Steam code: 123456";
-        let payload = proton_box_body(&hex::encode(owner_pub.as_bytes()), plain).expect("box body");
+        let payload = proton_box_body(&hex::encode(&ek), plain).expect("box body");
         assert!(payload.contains("infmail-box-v1"));
         // сервер НЕ может расшифровать без приватного ключа: формат не plaintext
         assert!(!payload.contains(plain));
         // браузер (владелец) расшифровывает
-        let dec = proton_unbox_body(&payload, &hex::encode(owner_sec.to_bytes())).expect("unbox");
+        let dec = proton_unbox_body(&payload, &hex::encode(seed)).expect("unbox");
         assert_eq!(dec, plain);
     }
 
     #[test]
     fn proton_box_body_empty() {
-        let owner_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-        let owner_pub = XPub::from(&owner_sec);
-        let payload = proton_box_body(&hex::encode(owner_pub.as_bytes()), "").unwrap();
+        let (seed, ek) = test_kem_pair();
+        let payload = proton_box_body(&hex::encode(&ek), "").unwrap();
         // пустой текст инкапсулируется без шифрования (enc=)
-        let dec = proton_unbox_body(&payload, &hex::encode(owner_sec.to_bytes())).unwrap();
+        let dec = proton_unbox_body(&payload, &hex::encode(seed)).unwrap();
         assert_eq!(dec, "");
     }
 
     #[test]
     fn proton_unbox_wrong_format_returns_none() {
-        assert!(proton_unbox_body("plain text", "00".repeat(32).as_str()).is_none());
-        assert!(proton_unbox_body("{\"proto\":\"other\"}", "00".repeat(32).as_str()).is_none());
+        assert!(proton_unbox_body("plain text", "00".repeat(64).as_str()).is_none());
+        assert!(proton_unbox_body("{\"proto\":\"other\"}", "00".repeat(64).as_str()).is_none());
     }
 }
 
@@ -8776,12 +9013,73 @@ mod disk_growth_tests {
         let node = Node::new(
             test_cfg("T"),
             NodeKeys::generate(),
+            PqKeys::generate(),
             tmp.clone(),
             PathBuf::new(),
         )
         .await
         .expect("node");
         (node, tmp)
+    }
+
+    /// `register_dns_candidate`: validated, idempotent, never self, and a
+    /// PQ-less candidate NEVER enters DHT routing (fail-closed there — only
+    /// the dialable peers map; the PQ key is learned post-handshake).
+    #[tokio::test]
+    async fn dns_candidate_registration_is_validated_idempotent_and_never_self() {
+        let (node, _tmp) = test_node("dns-cand").await;
+        // Happy: foreign ed + dialable endpoint registers under the
+        // ed-derived map key (TOFU precedent, NOT a NodeId).
+        let ed = [0x51u8; 32];
+        let pid = node
+            .register_dns_candidate(&hex::encode(ed), vec!["127.0.0.1:9411".into()])
+            .await
+            .expect("register");
+        let want = blake3::hash(&ed);
+        assert_eq!(&pid[..], &want.as_bytes()[..crate::proto::NODEID_LEN]);
+        assert!(node.peers.read().await.contains_key(&pid));
+        // ...but NOT in DHT routing (no validated PQ pin exists for it).
+        let near = node.routing.read().await.closest(&pid, 1);
+        assert!(
+            !near.iter().any(|n| n.id == pid),
+            "PQ-less candidate must not enter routing"
+        );
+        // Idempotent: re-registration is Ok and adds nothing.
+        let n0 = node.peers.read().await.len();
+        let pid2 = node
+            .register_dns_candidate(&hex::encode(ed), vec!["127.0.0.1:9412".into()])
+            .await
+            .expect("re-register");
+        assert_eq!(pid, pid2);
+        assert_eq!(node.peers.read().await.len(), n0);
+        // Self refused (own ed key — DNS ids are ed-derived, local id is PQ,
+        // so the check compares the key).
+        let self_ed = hex::encode(node.keys.verifying.as_bytes());
+        assert!(node
+            .register_dns_candidate(&self_ed, vec!["127.0.0.1:9413".into()])
+            .await
+            .is_err());
+        // Malformed ed refused (non-hex, wrong length).
+        assert!(node
+            .register_dns_candidate("zz", vec!["127.0.0.1:9414".into()])
+            .await
+            .is_err());
+        assert!(node
+            .register_dns_candidate(&hex::encode([0u8; 16]), vec!["127.0.0.1:9414".into()])
+            .await
+            .is_err());
+        // No dialable endpoints refused (empty, unparsable).
+        assert!(node
+            .register_dns_candidate(&hex::encode([0x52u8; 32]), vec![])
+            .await
+            .is_err());
+        assert!(node
+            .register_dns_candidate(
+                &hex::encode([0x52u8; 32]),
+                vec!["not-an-endpoint".into()]
+            )
+            .await
+            .is_err());
     }
 
     /// Отсортированные имена файлов чанков бакета (включая мусорные .tmp — их быть не должно).
@@ -9429,13 +9727,13 @@ mod session_heal_tests {
         }
     }
 
-    fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+    fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
-            node_id: keys.id_hex(),
             ed_pub: hex::encode(keys.verifying.to_bytes()),
-            x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-            pq_pub: None,
+            // FULL-PQ: identity is PQ-only (`primary_id` derives the PQ id
+            // from the pinned `pq_pub` — existing helper, no new logic).
+            pq_pub: Some(pq.pq_pub_hex()),
             endpoints: vec![listen.to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,
@@ -9461,17 +9759,21 @@ mod session_heal_tests {
             std::fs::create_dir_all(&tmp).expect("tmpdir");
             let ka = NodeKeys::generate();
             let kb = NodeKeys::generate();
-            let (lo_keys, hi_keys, lo_listen, hi_listen) = if ka.id() < kb.id() {
+            let pa = PqKeys::generate();
+            let pb = PqKeys::generate();
+            // FULL-PQ: tie-break orders by PQ id (same `ceremony_local_id`
+            // construction as `Node::new`, no duplicate logic).
+            let ida = crate::node::ceremony_local_id(&ka, &pa);
+            let idb = crate::node::ceremony_local_id(&kb, &pb);
+            let (lo_keys, lo_pq, hi_keys, hi_pq, lo_listen, hi_listen) = if ida < idb {
                 (
-                    ka,
-                    kb,
+                    ka, pa, kb, pb,
                     format!("127.0.0.1:{port_base}"),
                     format!("127.0.0.1:{}", port_base + 1),
                 )
             } else {
                 (
-                    kb,
-                    ka,
+                    kb, pb, ka, pa,
                     format!("127.0.0.1:{}", port_base + 1),
                     format!("127.0.0.1:{port_base}"),
                 )
@@ -9479,16 +9781,18 @@ mod session_heal_tests {
             let lo_listen: &str = Box::leak(lo_listen.into_boxed_str());
             let hi_listen: &str = Box::leak(hi_listen.into_boxed_str());
             let lo = Node::new(
-                cfg("LO", lo_listen, vec![peer_of("HI", &hi_keys, hi_listen)]),
+                cfg("LO", lo_listen, vec![peer_of("HI", &hi_keys, &hi_pq, hi_listen)]),
                 lo_keys.clone(),
+                lo_pq.clone(),
                 tmp.join("lo"),
                 PathBuf::new(),
             )
             .await
             .expect("node LO");
             let hi = Node::new(
-                cfg("HI", hi_listen, vec![peer_of("LO", &lo_keys, lo_listen)]),
+                cfg("HI", hi_listen, vec![peer_of("LO", &lo_keys, &lo_pq, lo_listen)]),
                 hi_keys.clone(),
+                hi_pq.clone(),
                 tmp.join("hi"),
                 PathBuf::new(),
             )
@@ -9500,8 +9804,8 @@ mod session_heal_tests {
                 serves.push(tokio::spawn(async move { c.serve().await }));
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let lo_id = lo_keys.id();
-            let hi_id = hi_keys.id();
+            let lo_id = crate::node::ceremony_local_id(&lo_keys, &lo_pq);
+            let hi_id = crate::node::ceremony_local_id(&hi_keys, &hi_pq);
             Pair {
                 lo,
                 hi,
@@ -9651,6 +9955,7 @@ mod pentest_net_tests {
         let node = Node::new(
             pentest_cfg("P"),
             NodeKeys::generate(),
+            PqKeys::generate(),
             tmp.clone(),
             PathBuf::new(),
         )
@@ -9763,11 +10068,12 @@ mod pentest_net_tests {
     async fn verification_dht_peer_flood_is_bound_per_identity() {
         let (node, tmp) = pentest_node("dynflood").await;
         let keys = NodeKeys::generate();
+        let pq = PqKeys::generate();
         let info = crate::dht::NodeInfo {
-            id: keys.id(),
+            id: pq.pq_id(),
             endpoints: vec!["127.0.0.1:1".to_string()],
             ed_hex: keys.ed_hex(),
-            x_hex: keys.x_hex(),
+            pq_hex: pq.pq_pub_hex(),
             last_seen: crate::dht::now_ms(),
         };
         node.ensure_dht_peer(&info).await.expect("dht peer inserts");

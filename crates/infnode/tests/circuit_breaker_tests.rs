@@ -18,7 +18,7 @@
 //! them breaks the test — the numbers below are the proof, not a copy).
 
 use infnode::config::NodeConfig;
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{
     circuit_backoff_secs, circuit_probe_endpoint, circuit_should_park,
     CIRCUIT_BACKOFF_FIRST_SECS, CIRCUIT_BACKOFF_MAX_SECS,
@@ -65,7 +65,8 @@ fn tmpdir(tag: &str) -> PathBuf {
 async fn fresh_node(tag: &str) -> (Arc<Node>, PathBuf) {
     let tmp = tmpdir(tag);
     let keys = NodeKeys::generate();
-    let node = Node::new(cfg("C"), keys, tmp.join("c"), PathBuf::new())
+    let pq = PqKeys::generate();
+    let node = Node::new(cfg("C"), keys, pq, tmp.join("c"), PathBuf::new())
         .await
         .expect("node");
     (node, tmp)

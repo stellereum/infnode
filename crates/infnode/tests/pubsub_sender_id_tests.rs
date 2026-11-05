@@ -13,7 +13,7 @@
 //! processes the message exactly the same way.
 
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,13 +40,11 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>) -> NodeConfig {
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -72,19 +70,23 @@ async fn pubsub_delivery_carries_the_sender_id() {
     let listen_b = "127.0.0.1:19421";
 
     let keys_a = NodeKeys::generate();
+    let pq_a = PqKeys::generate();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
 
     let node_a = Node::new(
-        cfg("A", listen_a, vec![peer_of("B", &keys_b, listen_b)]),
+        cfg("A", listen_a, vec![peer_of("B", &keys_b, &pq_b, listen_b)]),
         keys_a.clone(),
+        pq_a.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let node_b = Node::new(
-        cfg("B", listen_b, vec![peer_of("A", &keys_a, listen_a)]),
+        cfg("B", listen_b, vec![peer_of("A", &keys_a, &pq_a, listen_a)]),
         keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -108,14 +110,14 @@ async fn pubsub_delivery_carries_the_sender_id() {
         .to_string()
         .into_bytes();
     node_a
-        .request_to(keys_b.id(), "pubsub.msg", p)
+        .request_to(pq_b.pq_id(), "pubsub.msg", p)
         .await
         .expect("A -> B request");
     let got = next_payload(&mut rx_b, "B").await;
     let v: serde_json::Value = serde_json::from_str(&got).expect("delivery is JSON");
     assert_eq!(
         v["src"].as_str(),
-        Some(hex::encode(keys_a.id()).as_str()),
+        Some(hex::encode(pq_a.pq_id()).as_str()),
         "the delivery must name the SENDER (A), got {got}"
     );
     assert_eq!(v["data"].as_str(), Some("payload-1"));
@@ -125,7 +127,7 @@ async fn pubsub_delivery_carries_the_sender_id() {
         .to_string()
         .into_bytes();
     node_a
-        .send_to(keys_b.id(), "pubsub.msg", p)
+        .send_to(pq_b.pq_id(), "pubsub.msg", p)
         .await
         .expect("A -> B fire-and-forget send");
     let got = next_payload(&mut rx_b, "B").await;
@@ -133,7 +135,7 @@ async fn pubsub_delivery_carries_the_sender_id() {
     assert_eq!(v["data"].as_str(), Some("payload-2"));
     assert_eq!(
         v["src"].as_str(),
-        Some(hex::encode(keys_a.id()).as_str()),
+        Some(hex::encode(pq_a.pq_id()).as_str()),
         "the fire-and-forget delivery must name the SENDER too, got {got}"
     );
 

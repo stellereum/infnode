@@ -317,18 +317,19 @@ enum Cmd {
     },
 }
 
-fn load(cfg: &Path) -> Result<(NodeConfig, NodeKeys, PathBuf, PathBuf)> {
+fn load(cfg: &Path) -> Result<(NodeConfig, NodeKeys, infnode::keyring::PqKeys, PathBuf, PathBuf)> {
     let cfg_obj = infnode::config::load(cfg)?;
     let keys_dir = cfg
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("keys");
     let keys = NodeKeys::load(&keys_dir)?;
+    let pq = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
     let data_dir = cfg
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    Ok((cfg_obj, keys, data_dir, cfg.to_path_buf()))
+    Ok((cfg_obj, keys, pq, data_dir, cfg.to_path_buf()))
 }
 
 #[tokio::main]
@@ -344,6 +345,8 @@ async fn main() -> Result<()> {
                 k.save(&dir.join("keys"))?;
                 k
             };
+            // FULL-PQ: PQ identity is mandatory (`pq-identity.key`, 0600/0700).
+            let pq = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
             let name = dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -372,26 +375,21 @@ async fn main() -> Result<()> {
                 infnode::config::save(&cfg_path, &cfg)?;
             }
             println!("=== InfNode node ===");
-            println!("node_id: {}", keys.id_hex());
+            println!("node_id: {}", pq.pq_id_hex());
             println!("ed_pub : {}", keys.ed_hex());
-            println!("x_pub  : {}", keys.x_hex());
+            println!("pq_pub : {}", pq.pq_pub_hex());
+            println!("kem_ek : {}", keys.kem_ek_hex());
             println!("keys   : {}/keys", dir.display());
             println!("config : {}", cfg_path.display());
         }
         Cmd::Init { dir, role, validator, validator_pub, listen, advertise, web_listen, domain, wallet } => {
-            // node_id валидатора = blake3(ed_pub)[..NODEID_LEN]. Если ed_pub не задан —
-            // используется TOFU (наш ключ как placeholder, Node заменит при первом контакте?).
-            // На практике: без ed_pub подключение не пройдёт авторизацию — выведем предупреждение.
-            fn ed_pub_to_id(ed_hex: &str, keys: &NodeKeys) -> String {
-                if ed_hex.is_empty() {
-                    return keys.id_hex(); // placeholder; чел должен указать validator-pub
-                }
-                let bytes = hex::decode(ed_hex).unwrap_or_default();
-                let h = blake3::hash(&bytes);
-                let mut id = [0u8; infnode::proto::NODEID_LEN];
-                id.copy_from_slice(&h.as_bytes()[..infnode::proto::NODEID_LEN]);
-                format!("inf1:{}", hex::encode(id))
-            }
+            // FULL-PQ: validator peer pins are PQ-only (`pq_pub` mandatory,
+            // `primary_id` derives the PQ id). `ed_pub` stays as the frozen
+            // auth/TLS pin. Old `node-id`/`x-pub` removed (nodes wiped).
+            // Federation DNS currently provides ed/ip only (no PQ) — such
+            // peers are constructed with `pq_pub: None` and fail closed at
+            // `Node::new` (`classical peer refused`); operator must add
+            // `pq-pub` to `node.yaml` manually (migration error is loud).
             std::fs::create_dir_all(&dir).ok();
             // ключи (не перезаписываем существующие)
             let keys = if dir.join("keys").join("identity.key").exists() {
@@ -401,6 +399,7 @@ async fn main() -> Result<()> {
                 k.save(&dir.join("keys"))?;
                 k
             };
+            let _pq = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
             let name = dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -426,11 +425,13 @@ async fn main() -> Result<()> {
                             match &ed_pub {
                                 Some(ep) => {
                                     println!("[federation] OK validator found: {nid} @ {ip} (ed_pub {})", &ep[..16]);
+                                    // FULL-PQ: federation DNS has no PQ yet —
+                                    // constructed without `pq_pub`, fails
+                                    // closed at `Node::new` until operator
+                                    // adds `pq-pub` (nodes wiped, no compat).
                                     peers.push(infnode::config::PeerConfig {
                                         name: "validator".into(),
-                                        node_id: nid,
                                         ed_pub: ep.clone(),
-                                        x_pub: String::new(),
                                         pq_pub: None,
                                         endpoints: vec![ip],
                                         allow: vec!["*".into()],
@@ -451,9 +452,10 @@ async fn main() -> Result<()> {
                 }
             }
             if let Some(vaddr) = &validator {
-                // если ed_pub не указан — TOFU: примем ключ при первом контакте (небезопасно,
-                // лучше указать validator-pub). Используем плейсхолдер "tofu" → Node при
-                // handshake заменит? Нет — проще требовать pub или оставить unknown.
+                // FULL-PQ: validator peer needs `ed-pub` (frozen auth/TLS pin)
+                // + mandatory `pq-pub` (identity). `--validator-pub` gives ed
+                // only; without pq the peer fails closed at `Node::new`
+                // (`classical peer refused`) until operator adds `pq-pub`.
                 let ed_pub = validator_pub.clone().unwrap_or_default();
                 let vname = if role.as_deref() == Some("validator") {
                     "self".into()
@@ -463,9 +465,7 @@ async fn main() -> Result<()> {
                 if vname != "self" {
                     peers.push(infnode::config::PeerConfig {
                         name: vname,
-                        node_id: ed_pub_to_id(&ed_pub, &keys),
                         ed_pub: ed_pub.clone(),
-                        x_pub: String::new(),
                         pq_pub: None,
                         endpoints: vec![vaddr.clone()],
                         allow: vec!["*".into()],
@@ -501,9 +501,9 @@ async fn main() -> Result<()> {
 
             println!("=== InfNode node initialized ===");
             println!("role      : {}", role.as_deref().unwrap_or("network"));
-            println!("node_id   : {}", keys.id_hex());
+            println!("node_id   : {}", _pq.pq_id_hex());
             println!("ed_pub    : {}", keys.ed_hex());
-            println!("x_pub     : {}", keys.x_hex());
+            println!("pq_pub    : {}", _pq.pq_pub_hex());
             println!("listen    : {}", listen);
             if let Some(w) = &wallet {
                 println!("wallet    : {}", w);
@@ -525,13 +525,14 @@ async fn main() -> Result<()> {
             if !config.exists() {
                 let dir = config.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
                 std::fs::create_dir_all(&dir).ok();
-                let keys = if dir.join("keys").join("identity.key").exists() {
+                let _keys = if dir.join("keys").join("identity.key").exists() {
                     NodeKeys::load(&dir.join("keys"))?
                 } else {
                     let k = NodeKeys::generate();
                     k.save(&dir.join("keys"))?;
                     k
                 };
+                let _ = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
                 let name = dir
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
@@ -544,25 +545,15 @@ async fn main() -> Result<()> {
                     _ => vec![],
                 };
                 let peers = if let Some(vaddr) = &validator {
-                    // node_id валидатора = blake3(ed_pub). Если ed_pub не знаем —
-                    // TOFU placeholder; но лучше чтобы чел дал --validator-pub.
+                    // FULL-PQ: validator needs ed (frozen auth/TLS) + pq
+                    // (identity, mandatory). No PQ yet → `pq_pub: None`,
+                    // fails closed at `Node::new` until operator adds it.
                     let ed_pub = validator_pub.clone()
                         .or_else(|| std::env::var("INFNODE_VALIDATOR_PUB").ok())
                         .unwrap_or_default();
-                    let nid = if ed_pub.is_empty() {
-                        keys.id_hex()
-                    } else {
-                        let bytes = hex::decode(&ed_pub).unwrap_or_default();
-                        let h = blake3::hash(&bytes);
-                        let mut id = [0u8; infnode::proto::NODEID_LEN];
-                        id.copy_from_slice(&h.as_bytes()[..infnode::proto::NODEID_LEN]);
-                        format!("inf1:{}", hex::encode(id))
-                    };
                     vec![infnode::config::PeerConfig {
                         name: "validator".into(),
-                        node_id: nid,
                         ed_pub,
-                        x_pub: String::new(),
                         pq_pub: None,
                         endpoints: vec![vaddr.clone()],
                         allow: vec!["*".into()],
@@ -595,15 +586,19 @@ async fn main() -> Result<()> {
                 infnode::config::save(&config, &cfg)?;
                 println!("config not found — generated a new one: {}", config.display());
             }
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
             // ПОДТВЕРЖДЕНИЕ ВАЛИДАТОРА (федерация, СТРОГО): если в конфиге указан domain и это НЕ валидатор,
             // нода ОБЯЗАНА пройти проверку TXT — иначе не запустится. Мягкий режим убран:
             // нода не может подключиться к неподтверждённому валидатору.
             if let Some(domain) = &cfg_obj.domain {
                 let is_validator = cfg_obj.storage_roles.len() == 2; // validator = обе роли
                 if !is_validator {
-                    // ожидаемый node_id валидатора = первый peer
-                    let expected = cfg_obj.peers.first().map(|p| p.node_id.clone());
+                    // ожидаемый PQ node_id валидатора = первый peer (`primary_id`).
+                    let expected = cfg_obj
+                        .peers
+                        .first()
+                        .and_then(|p| p.primary_id().ok())
+                        .map(|id| format!("inf1:{}", hex::encode(id)));
                     if let Some(exp_nid) = expected {
                         println!("[federation] checking validator of domain {domain}...");
                         match infnode::federation::verify_domain_validator(domain, &exp_nid).await {
@@ -622,7 +617,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let node = Node::new(cfg_obj, keys, data_dir.clone(), config_path).await?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir.clone(), config_path).await?;
             if std::env::var("INFNODE_REWARDS").as_deref() == Ok("1") {
                 let node_r = node.clone();
                 let data_dir_r = data_dir.clone();
@@ -647,14 +642,14 @@ async fn main() -> Result<()> {
             service,
             data,
         } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let resp = node.request(&to, &service, data.into_bytes()).await?;
             println!("{}", String::from_utf8_lossy(&resp));
         }
         Cmd::Ping { config, to, count } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             println!("{}", node.ping(&to, count).await?);
         }
         Cmd::Perf {
@@ -664,13 +659,13 @@ async fn main() -> Result<()> {
             count,
             direction,
         } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             println!("{}", node.perf(&to, size, count, &direction).await?);
         }
         Cmd::Poke { config, to } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             println!("{}", node.poke(&to).await?);
         }
         Cmd::PubsubPublish {
@@ -680,8 +675,8 @@ async fn main() -> Result<()> {
             data,
         } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let payload = json!({ "topic": topic, "data": data }).to_string().into_bytes();
             let resp = node.request(&to, "pubsub.publish", payload).await?;
             println!("{}", String::from_utf8_lossy(&resp));
@@ -693,8 +688,8 @@ async fn main() -> Result<()> {
             timeout,
         } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let mut rx = node.register_app_sub(&topic).await;
             let payload = json!({ "topic": topic }).to_string().into_bytes();
             let resp = node.request(&to, "pubsub.subscribe", payload).await?;
@@ -726,16 +721,16 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Status { config } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             println!("{}", node.status().await?);
         }
         Cmd::MailRegister { config, email, dir, to: _ } => {
             use serde_json::json;
             let keys = infnode::mailbox::MailKeys::generate();
             keys.save(&dir, &email)?;
-            let (cfg_obj, keys2, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys2, data_dir, config_path).await?;
+            let (cfg_obj, keys2, pq2, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys2, pq2, data_dir, config_path).await?;
             // проверка: email уже занят? (защита от захвата чужого ящика)
             let ukey = format!("user:{email}");
             let h0 = blake3::hash(ukey.as_bytes());
@@ -778,8 +773,8 @@ async fn main() -> Result<()> {
         }
         Cmd::MailSend { config, to, from, dest, subject, body, dir } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             // 1) реестр: получаем x_pub получателя
             let ukey = format!("user:{dest}");
             let h = blake3::hash(ukey.as_bytes());
@@ -803,8 +798,10 @@ async fn main() -> Result<()> {
                 }
             }
             let rx_hex = rx.ok_or_else(|| anyhow::anyhow!("recipient {dest} is not registered"))?;
-            let rx_bytes: [u8; 32] = hex::decode(&rx_hex)?.try_into().map_err(|_| anyhow::anyhow!("bad x_pub"))?;
-            let recipient_pub = x25519_dalek::PublicKey::from(rx_bytes);
+            let rx_bytes = hex::decode(&rx_hex).map_err(|_| anyhow::anyhow!("bad kem_pub"))?;
+            if rx_bytes.len() != infnode::mailbox::KEM_EK_LEN {
+                return Err(anyhow::anyhow!("bad kem_pub length"));
+            }
             // 1б) реестр отправителя: ed_pub для подписи
             let fkey = format!("user:{from}");
             let fh = blake3::hash(fkey.as_bytes());
@@ -837,7 +834,7 @@ async fn main() -> Result<()> {
             let envelope = json!({ "payload": String::from_utf8_lossy(&plain), "sig": hex::encode(sig) })
                 .to_string()
                 .into_bytes();
-            let blob = infnode::mailbox::seal(&recipient_pub, &envelope)?;
+            let blob = infnode::mailbox::seal(&rx_bytes, &envelope)?;
             let id = hex::encode(blake3::hash(format!("{from}:{dest}:{}", infnode::proto::now_ms()).as_bytes()).as_bytes());
             // 3) храним письмо в storage (репликация)
             let mname = format!("mail:{dest}:{id}");
@@ -879,8 +876,8 @@ async fn main() -> Result<()> {
         }
         Cmd::MailList { config, to, email, dir } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let ikey = format!("mail:{email}:index");
             let h = blake3::hash(ikey.as_bytes());
             let mut target = [0u8; 20];
@@ -937,8 +934,8 @@ async fn main() -> Result<()> {
         }
         Cmd::MailGet { config, to: _, email, id, dir } => {
             let keys = infnode::mailbox::MailKeys::load(&dir, &email)?;
-            let (cfg_obj, node_keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, node_keys, data_dir, config_path).await?;
+            let (cfg_obj, node_keys, node_pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, node_keys, node_pq, data_dir, config_path).await?;
             // скачиваем письмо из storage (через манифест)
             let mname = format!("mail:{email}:{id}");
             let blob = node.fetch_mail(&mname).await.ok_or_else(|| anyhow::anyhow!("mail not found"))?;
@@ -980,8 +977,8 @@ async fn main() -> Result<()> {
         } => {
             use serde_json::json;
             let data = std::fs::read(&file)?;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             // чанкинг по 1MB
             const CHUNK: usize = 1024 * 1024;
             let mut chunks: Vec<serde_json::Value> = Vec::new();
@@ -1029,8 +1026,8 @@ async fn main() -> Result<()> {
         }
         Cmd::StorageGet { config, to: _, name, out, bucket } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             // читаем манифест из DHT
             let mkey = format!("{bucket}:{name}");
             let h = blake3::hash(mkey.as_bytes());
@@ -1097,8 +1094,8 @@ async fn main() -> Result<()> {
             println!("get ok: name={name} -> {} ({} bytes)", out.display(), nbytes);
         }
         Cmd::DhtFind { config, to: _, target } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let t = node.resolve(&target)?;
             let nodes = node.dht_find_node(&t).await;
             for n in nodes {
@@ -1107,8 +1104,8 @@ async fn main() -> Result<()> {
         }
         Cmd::DhtStore { config, to, key, value } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let _t = node.resolve(&to)?;
             // ключ -> target = blake3(key)
             let h = blake3::hash(key.as_bytes());
@@ -1128,8 +1125,8 @@ async fn main() -> Result<()> {
         }
         Cmd::DhtGet { config, to, key } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let _t = node.resolve(&to)?;
             let h = blake3::hash(key.as_bytes());
             let mut target = [0u8; 20];
@@ -1156,8 +1153,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Find { config, to, node } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node_obj = Node::new(cfg_obj, keys, data_dir, config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node_obj = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             let payload = json!({ "node": node }).to_string().into_bytes();
             let resp = node_obj.request(&to, "dht.lookup", payload).await?;
             println!("{}", String::from_utf8_lossy(&resp));
@@ -1239,8 +1236,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Consensus { config, hash_only } => {
             use serde_json::json;
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node = Node::new(cfg_obj.clone(), keys, data_dir.clone(), config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj.clone(), keys, pq, data_dir.clone(), config_path).await?;
             // даём время на установление QUIC-связи с пирами (подписи шлются по установленным conn)
             let want = cfg_obj.peers.len();
             for _ in 0..20 {
@@ -1314,9 +1311,9 @@ async fn main() -> Result<()> {
             println!("written   : {}/consensus.json", data_dir.display());
         }
         Cmd::Restore { config } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
-            let node_id = keys.id_hex();
-            let node = Node::new(cfg_obj, keys, data_dir.clone(), config_path).await?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node_id = pq.pq_id_hex();
+            let node = Node::new(cfg_obj, keys, pq, data_dir.clone(), config_path).await?;
             println!("=== Validator restore from network ===");
             println!("node_id : {}", node_id);
             println!("peers   : {}", node.known_peers().await.len());
@@ -1345,8 +1342,10 @@ async fn main() -> Result<()> {
             });
         }
         Cmd::Announce { domain, advertise, config } => {
-            // node_id + ed_pub валидатора из ключей
-            let (cfg_obj, keys, _, _) = load(&config)?;
+            // Federation TXT is frozen classical (`node_id=blake3(ed)`,
+            // out of zone) — announce uses the classical id even though
+            // routing/NodeId is PQ-only.
+            let (cfg_obj, keys, _pq, _, _) = load(&config)?;
             let node_id = keys.id_hex();
             let ed_pub = keys.ed_hex();
             let ip = advertise.split(':').next().unwrap_or(&advertise).to_string();

@@ -26,7 +26,7 @@
 
 use ed25519_dalek::Signer;
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, RateBucket};
 use infnode::proto::{self, Frame, NODEID_LEN};
 use std::net::SocketAddr;
@@ -79,13 +79,11 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>, allow_unknown: bool) ->
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, listen: &str, rate: u32) -> PeerConfig {
+fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str, rate: u32) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
-        x_pub: hex::encode(keys.e2e_pub.as_bytes()),
-        pq_pub: None,
+        pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: rate,
@@ -211,7 +209,9 @@ fn det_payload(keys: &NodeKeys, seed: u64, at: i64) -> String {
         "at": at,
         "eph": eph,
         "ed": hex::encode(keys.verifying.to_bytes()),
-        "x": hex::encode(keys.e2e_pub.as_bytes()),
+        "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
+        "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
     })
     .to_string()
 }
@@ -243,10 +243,12 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     let tmp = tmpdir("flood");
     let listen: SocketAddr = "127.0.0.1:19741".parse().unwrap();
     let keys_v = NodeKeys::generate();
+    let pq_v = PqKeys::generate();
     let keys_h = NodeKeys::generate();
+    let pq_h = PqKeys::generate();
     let victim = Node::new(
-        cfg("V", "127.0.0.1:19741", vec![peer_of("H", &keys_h, "127.0.0.1:19742", 0)], true),
-        keys_v.clone(),
+        cfg("V", "127.0.0.1:19741", vec![peer_of("H", &keys_h, &pq_h, "127.0.0.1:19742", 0)], true),
+        keys_v.clone(), pq_v.clone(),
         tmp.join("v"),
         PathBuf::new(),
     )
@@ -258,8 +260,8 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     });
     // Honest full node H with static route to V (for core.ping delivery rate).
     let honest = Node::new(
-        cfg("H", "127.0.0.1:19742", vec![peer_of("V", &keys_v, "127.0.0.1:19741", 0)], false),
-        keys_h.clone(),
+        cfg("H", "127.0.0.1:19742", vec![peer_of("V", &keys_v, &pq_v, "127.0.0.1:19741", 0)], false),
+        keys_h.clone(), pq_h.clone(),
         tmp.join("h"),
         PathBuf::new(),
     )
@@ -270,7 +272,7 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let v_id = keys_v.id();
+    let v_id = pq_v.pq_id();
 
     // Warmup: honest ping works pre-attack.
     let r = tokio::time::timeout(Duration::from_secs(15), honest.request_to(v_id, "core.ping", vec![]))
@@ -437,9 +439,10 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
     let tmp = tmpdir("sybil");
     let listen: SocketAddr = "127.0.0.1:19743".parse().unwrap();
     let keys_v = NodeKeys::generate();
+    let pq_v = PqKeys::generate();
     let victim = Node::new(
         cfg("V", "127.0.0.1:19743", vec![], true),
-        keys_v.clone(),
+        keys_v.clone(), pq_v.clone(),
         tmp.join("v"),
         PathBuf::new(),
     )
@@ -477,7 +480,7 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
     assert_eq!(banned, 0, "throttle imposes no ban: attacker ban share 0/{N}");
 
     // Honest identity born neutral at the same layer while sybils burn.
-    let honest = NodeKeys::generate().id();
+    let honest = PqKeys::generate().pq_id();
     assert_eq!(victim.rep_score(&honest).await, 0, "honest stays neutral");
     assert!(!victim.rep_is_throttled(&honest).await);
     assert!(!victim.rep_is_banned(&honest).await);
@@ -551,23 +554,26 @@ async fn eclipse_dht_poison_honest_records_persist() {
     );
     assert_eq!(kv.get("eclipse:rule").as_deref(), Some("v-honest-v2"));
 
-    // Route-record gate: honest binding valid, forged binding refused.
+    // Route-record gate (FULL-PQ): honest PQ binding valid, forged binding
+    // refused (`pq` must derive `id`; `ed` is the frozen auth pin, NOT identity).
     let honest_keys = NodeKeys::generate();
+    let honest_keys_pq = PqKeys::generate();
     let evil_keys = NodeKeys::generate();
+    let evil_keys_pq = PqKeys::generate();
     assert!(infnode::dht::node_info_valid(
-        &honest_keys.id(),
+        &honest_keys_pq.pq_id(),
         &hex::encode(honest_keys.verifying.to_bytes()),
-        &hex::encode(honest_keys.e2e_pub.as_bytes()),
+        &honest_keys_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
     assert!(
         !infnode::dht::node_info_valid(
-            &honest_keys.id(),
+            &honest_keys_pq.pq_id(),
             &hex::encode(evil_keys.verifying.to_bytes()),
-            &hex::encode(evil_keys.e2e_pub.as_bytes()),
+            &evil_keys_pq.pq_pub_hex(),
             &["127.0.0.1:1".to_string()],
         ),
-        "bogus advertisement for honest ID refused (ed must derive id)"
+        "bogus advertisement for honest PQ ID refused (pq must derive id)"
     );
     assert!(!infnode::dht::endpoint_ok("not an endpoint"));
     assert!(infnode::dht::endpoint_ok("127.0.0.1:1"));
@@ -575,18 +581,20 @@ async fn eclipse_dht_poison_honest_records_persist() {
     // Network: honest store then poison attempts over real RPC.
     let tmp = tmpdir("dhtpoison");
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", "127.0.0.1:19744", vec![peer_of("B", &kb, "127.0.0.1:19745", 0)], false),
-        ka.clone(),
+        cfg("A", "127.0.0.1:19744", vec![peer_of("B", &kb, &pb, "127.0.0.1:19745", 0)], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", "127.0.0.1:19745", vec![peer_of("A", &ka, "127.0.0.1:19744", 0)], false),
-        kb.clone(),
+        cfg("B", "127.0.0.1:19745", vec![peer_of("A", &ka, &pa, "127.0.0.1:19744", 0)], false),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -601,7 +609,7 @@ async fn eclipse_dht_poison_honest_records_persist() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
     let key = "eclipse:honest:key";
 
     // Honest write lands.
@@ -710,7 +718,7 @@ async fn eclipse_churn_storm_peer_table_bounded() {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
             ed_hex: String::new(),
-            x_hex: String::new(),
+            pq_hex: String::new(),
             last_seen: 1,
         });
     }
@@ -729,7 +737,7 @@ async fn eclipse_churn_storm_peer_table_bounded() {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
             ed_hex: String::new(),
-            x_hex: String::new(),
+            pq_hex: String::new(),
             last_seen: 2,
         });
     }
@@ -738,18 +746,20 @@ async fn eclipse_churn_storm_peer_table_bounded() {
     // Live reconnect churn between two static peers.
     let tmp = tmpdir("churn");
     let ka = NodeKeys::generate();
+    let pa = PqKeys::generate();
     let kb = NodeKeys::generate();
+    let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", "127.0.0.1:19746", vec![peer_of("B", &kb, "127.0.0.1:19747", 0)], false),
-        ka.clone(),
+        cfg("A", "127.0.0.1:19746", vec![peer_of("B", &kb, &pb, "127.0.0.1:19747", 0)], false),
+        ka.clone(), pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", "127.0.0.1:19747", vec![peer_of("A", &ka, "127.0.0.1:19746", 0)], false),
-        kb.clone(),
+        cfg("B", "127.0.0.1:19747", vec![peer_of("A", &ka, &pa, "127.0.0.1:19746", 0)], false),
+        kb.clone(), pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -764,7 +774,7 @@ async fn eclipse_churn_storm_peer_table_bounded() {
         async move { n.serve().await }
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let b_id = kb.id();
+    let b_id = pb.pq_id();
     let peers_before = a.peers.read().await.len();
     let known_before = a.known_peers().await.len();
 
@@ -783,8 +793,10 @@ async fn eclipse_churn_storm_peer_table_bounded() {
     assert_eq!(known_before, known_after, "known set constant under churn ({known_before})");
     assert!(known_after <= 8, "known set small bound, got {known_after}");
 
-    // Invalid DHT-discovered records never enter the peer table.
+    // Invalid DHT-discovered records never enter the peer table (FULL-PQ:
+    // `pq` must derive `id`; forged `fake` ids with attacker `pq` are refused).
     let evil = NodeKeys::generate();
+    let evil_pq = PqKeys::generate();
     let peers_pre_poison = b.peers.read().await.len();
     for i in 0..20u32 {
         let mut fake = [0xCDu8; NODEID_LEN];
@@ -794,7 +806,7 @@ async fn eclipse_churn_storm_peer_table_bounded() {
                 id: fake,
                 endpoints: vec!["127.0.0.1:9".to_string()],
                 ed_hex: hex::encode(evil.verifying.to_bytes()),
-                x_hex: hex::encode(evil.e2e_pub.as_bytes()),
+                pq_hex: evil_pq.pq_pub_hex(),
                 last_seen: infnode::dht::now_ms(),
             })
             .await;

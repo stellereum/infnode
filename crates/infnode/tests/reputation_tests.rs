@@ -17,7 +17,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
-use infnode::keyring::NodeKeys;
+use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
 use infnode::proto::{self, Frame, NODEID_LEN};
 use infnode::reputation::{REP_SCORE_MAX, REP_SCORE_MIN};
@@ -82,9 +82,10 @@ async fn fresh_node(tag: &str) -> (std::sync::Arc<Node>, PathBuf) {
     rep_env();
     let tmp = tmpdir(tag);
     let keys = NodeKeys::generate();
+    let pq = PqKeys::generate();
     let node = Node::new(
         cfg("S", "127.0.0.1:0", vec![], false),
-        keys,
+        keys, pq,
         tmp.join("s"),
         PathBuf::new(),
     )
@@ -473,7 +474,9 @@ fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
         "at": at,
         "eph": hex::encode(eph_pub.as_bytes()),
         "ed": hex::encode(keys.verifying.to_bytes()),
-        "x": hex::encode(keys.e2e_pub.as_bytes()),
+        "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
+        "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
     })
     .to_string()
 }
@@ -500,9 +503,10 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     let tmp = tmpdir("quic");
     let listen: SocketAddr = "127.0.0.1:19931".parse().unwrap();
     let keys_b = NodeKeys::generate();
+    let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19931", vec![], true),
-        keys_b.clone(),
+        keys_b.clone(), pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
