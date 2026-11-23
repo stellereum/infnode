@@ -1,0 +1,1469 @@
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use infnode::config::NodeConfig;
+use infnode::keyring::NodeKeys;
+use infnode::node::Node;
+
+#[derive(Parser)]
+#[command(
+    name = "infnode",
+    version,
+    about = "Lightweight overlay protocol on QUIC + Ed25519"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Сгенерировать ключи ноды и пример конфига
+    Keygen {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Инициализировать ноду: ключи + конфиг с ролью и авто-подключением к валидатору.
+    /// Пример: infnode init --role mail --validator 109.107.155.67:9400 --validator-pub <falcon512_pq_pub_hex>
+    /// После init: infnode serve --config node.yaml (или --role для быстрого запуска).
+    Init {
+        /// рабочая папка ноды (создаст keys/ + node.yaml)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// роль хранения: mail | files | both (пусто = только сеть)
+        #[arg(long)]
+        role: Option<String>,
+        /// адрес валидатора (endpoints), напр. 109.107.155.67:9400
+        #[arg(long)]
+        validator: Option<String>,
+        /// ed-pub валидатора (hex, без inf1:) — для аутентификации подключения
+        #[arg(long)]
+        validator_pub: Option<String>,
+        /// слушать на этом адресе (default 0.0.0.0:9400)
+        #[arg(long, default_value = "0.0.0.0:9400")]
+        listen: String,
+        /// публичный advertise адрес (для нод за NAT); пусто = listen
+        #[arg(long)]
+        advertise: Option<String>,
+        /// web-интерфейс валидатора (только для role=validator)
+        #[arg(long)]
+        web_listen: Option<String>,
+        /// домен сети (федерация), напр. infmail.org — для DNS TXT подтверждения валидатора
+        #[arg(long)]
+        domain: Option<String>,
+        /// TON-кошелёк владельца ноды (для выплат наград)
+        #[arg(long)]
+        wallet: Option<String>,
+    },
+    /// Запустить ноду (сервер + исходящие соединения).
+    /// Если конфиг не существует — сгенерирует его с ролью и авто-подключением к валидатору.
+    Serve {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        /// роль хранения: mail | files | both | validator (если конфиг ещё не создан)
+        #[arg(long)]
+        role: Option<String>,
+        /// адрес валидатора (если конфиг ещё не создан)
+        #[arg(long)]
+        validator: Option<String>,
+        /// ed-pub валидатора (hex, без inf1:), если конфиг ещё не создан
+        #[arg(long)]
+        validator_pub: Option<String>,
+        /// домен сети (федерация), напр. infmail.org — для DNS TXT подтверждения валидатора
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Отправить запрос в сервис удалённой ноды
+    Send {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        data: String,
+    },
+    /// Пинг удалённой ноды (RTT)
+    Ping {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "5")]
+        count: u32,
+    },
+    /// Тест пропускной способности
+    Perf {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "1048576")]
+        size: usize,
+        #[arg(long, default_value = "5")]
+        count: u32,
+        #[arg(long, default_value = "echo", help = "echo | upload | download")]
+        direction: String,
+    },
+    /// NAT hole punch discovery через удалённую ноду
+    Poke {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+    },
+    /// Опубликовать сообщение в топик (флуд по mesh)
+    PubsubPublish {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        data: String,
+    },
+    /// Подписаться на топик и печатать сообщения N секунд
+    PubsubSubscribe {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
+    /// Статус ноды и пиров
+    Status {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+    },
+    /// InfMail: зарегистрировать почтовый ящик (ключи + реестр в DHT)
+    MailRegister {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = ".mailkeys")]
+        dir: PathBuf,
+        #[arg(long)]
+        to: String,
+    },
+    /// InfMail: отправить E2E-письмо
+    MailSend {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        dest: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long, default_value = ".mailkeys")]
+        dir: PathBuf,
+    },
+    /// InfMail: список писем ящика
+    MailList {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = ".mailkeys")]
+        dir: PathBuf,
+    },
+    /// InfMail: прочитать письмо (расшифровать)
+    MailGet {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = ".mailkeys")]
+        dir: PathBuf,
+    },
+    /// Storage: положить файл/данные (чанки + репликация + манифест в DHT)
+    StoragePut {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "files")]
+        bucket: String,
+        /// ML-KEM-768 owner encapsulation key (hex) used to seal the blob.
+        /// Omit to seal to this node's own KEM key (owner = operator).
+        #[arg(long)]
+        owner_ek: Option<String>,
+        /// Read the owner ML-KEM-768 seed from a 0600 file (`-` = stdin).
+        /// Preferred over `--owner-key`: a file is not exposed in `ps`.
+        #[arg(long, value_name = "PATH")]
+        owner_key_file: Option<PathBuf>,
+        /// DEPRECATED: owner ML-KEM-768 seed (hex, secret) passed on argv.
+        /// It is visible in `ps` / `/proc/<pid>/cmdline`; use
+        /// `--owner-key-file`, `$INFNODE_OWNER_KEY`, or stdin instead.
+        #[arg(long)]
+        owner_key: Option<String>,
+    },
+    /// Storage: получить файл/данные по имени
+    StorageGet {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "files")]
+        bucket: String,
+        /// Read the owner ML-KEM-768 seed from a 0600 file (`-` = stdin).
+        /// Preferred over `--owner-key`: a file is not exposed in `ps`.
+        #[arg(long, value_name = "PATH")]
+        owner_key_file: Option<PathBuf>,
+        /// DEPRECATED: owner ML-KEM-768 seed (hex, secret) passed on argv.
+        /// It is visible in `ps` / `/proc/<pid>/cmdline`; use
+        /// `--owner-key-file`, `$INFNODE_OWNER_KEY`, or stdin instead.
+        #[arg(long)]
+        owner_key: Option<String>,
+    },
+    /// DHT: найти k ближайших нод к target
+    DhtFind {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        target: String,
+    },
+    /// DHT: сохранить значение под ключом (репликация на k ближайших)
+    DhtStore {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        value: String,
+    },
+    /// DHT: найти значение по ключу
+    DhtGet {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// Discovery: найти ноду по её inf1:... через сеть
+    Find {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        node: String,
+    },
+    /// Быстрая сводка ноды: kv, chunks, rewards, payouts (встроенная observability)
+    Stats {
+        /// data-dir ноды (по умолчанию рядом с конфигом)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Сгенерировать DNS TXT подтверждение валидатора (федерация).
+    /// Пример: infnode announce --domain infmail.org --advertise 109.107.155.67:9400
+    Announce {
+        /// домен сети (федерации), напр. infmail.org
+        #[arg(long)]
+        domain: String,
+        /// публичный адрес валидатора, напр. 109.107.155.67:9400
+        #[arg(long)]
+        advertise: String,
+        /// путь к node.yaml валидатора (для node_id)
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+    },
+    /// Проверить, что DNS TXT домена подтверждает валидатора (node_id).
+    /// Пример: infnode verify-validator --domain infmail.org --node-id inf1:...
+    VerifyValidator {
+        /// домен сети
+        #[arg(long)]
+        domain: String,
+        /// node_id валидатора (inf1:...)
+        #[arg(long)]
+        node_id: String,
+    },
+    /// Восстановить валидатора после сноса: подключиться к нодам, синкать KV (dht.sync),
+    /// восстановить манифесты/индексы/профили аккаунтов из DHT. Секреты (pw_hash/smtp_pass/e2e_secret)
+    /// НЕ реплицируются — их нужно восстановить из бэкапа ключей валидатора (keys/).
+    /// Пример: infnode restore --config node.yaml
+    Restore {
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+    },
+    /// Аудит kv.json через Zig FFI (быстрая статистика)
+    AuditKv {
+        /// Путь к kv.json (по умолчанию ./kv.json относительно конфига)
+        #[arg(long)]
+        kv: Option<PathBuf>,
+        /// Поиск ключей по подстроке
+        #[arg(long)]
+        find: Option<String>,
+    },
+    /// Консенсус: мастер считает хэш состояния, запрашивает подписи у валидаторов (validators),
+    /// проверяет кворум ceil(2/3·N) и пишет consensus.json.
+    /// При 1 валидаторе мастер подписывает сам (1 из 1); при 3 — нужны 2 из 3.
+    Consensus {
+        /// конфиг (node.yaml) мастера
+        #[arg(long, default_value = "node.yaml")]
+        config: PathBuf,
+        /// только посчитать хэш состояния (без запроса подписей)
+        #[arg(long)]
+        hash_only: bool,
+    },
+}
+
+fn load(
+    cfg: &Path,
+) -> Result<(
+    NodeConfig,
+    NodeKeys,
+    infnode::keyring::PqKeys,
+    PathBuf,
+    PathBuf,
+)> {
+    let cfg_obj = infnode::config::load(cfg)?;
+    let keys_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("keys");
+    let keys = NodeKeys::load(&keys_dir)?;
+    let pq = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
+    let data_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    Ok((cfg_obj, keys, pq, data_dir, cfg.to_path_buf()))
+}
+
+/// Environment fallback for the owner ML-KEM seed.
+const OWNER_KEY_ENV: &str = "INFNODE_OWNER_KEY";
+
+/// Read the owner seed from a file, or from stdin when `path` is `-`.
+///
+/// A file carrying a secret must not be readable by group/other; on Unix a
+/// mode with any `0o077` bit set is refused (fail closed) instead of silently
+/// using a world-readable key.
+fn read_owner_key_file(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("read owner key from stdin")?;
+        return Ok(buf);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("owner key file {}: cannot stat", path.display()))?;
+        if !meta.is_file() {
+            bail!("owner key file {} is not a regular file", path.display());
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "owner key file {} is readable by group/other (mode {mode:03o}); \
+                 chmod 600 it (or use --owner-key-file - / ${OWNER_KEY_ENV})",
+                path.display()
+            );
+        }
+    }
+    std::fs::read_to_string(path).with_context(|| format!("read owner key file {}", path.display()))
+}
+
+/// Trim and validate an ML-KEM-768 seed supplied by a file/env/argv.
+fn normalize_owner_key(raw: &str, source: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let key = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+        .trim();
+    if key.is_empty() {
+        bail!("owner key from {source} is empty");
+    }
+    let bytes = hex::decode(key).with_context(|| format!("owner key from {source} is not hex"))?;
+    let want = infnode::mailbox::KEM_SEED_LEN;
+    if bytes.len() != want {
+        bail!(
+            "owner key from {source} must be exactly {} hex chars ({want}-byte ML-KEM-768 seed); \
+             got {} bytes",
+            want * 2,
+            bytes.len()
+        );
+    }
+    Ok(key.to_string())
+}
+
+/// Resolve the owner seed in safety order: `--owner-key-file` (0600 / `-` for
+/// stdin), then `$INFNODE_OWNER_KEY`, then the DEPRECATED argv form.
+///
+/// `None` means "no owner key supplied"; the caller keeps its existing
+/// fallback (this node's own KEM seed). The argv form is kept working for
+/// compatibility but warns loudly because argv is world-readable on Linux.
+fn resolve_owner_key(argv: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    if let Some(path) = file {
+        if argv.is_some() {
+            eprintln!(
+                "[infnode] WARNING: ignoring --owner-key because --owner-key-file was supplied"
+            );
+        }
+        let raw = read_owner_key_file(&path)?;
+        return Ok(Some(normalize_owner_key(
+            &raw,
+            &format!("{}", path.display()),
+        )?));
+    }
+    if let Ok(raw) = std::env::var(OWNER_KEY_ENV) {
+        if !raw.trim().is_empty() {
+            return Ok(Some(normalize_owner_key(&raw, OWNER_KEY_ENV)?));
+        }
+    }
+    if let Some(raw) = argv {
+        eprintln!(
+            "[infnode] WARNING: --owner-key is DEPRECATED and UNSAFE: the ML-KEM seed is \
+             visible in `ps`, /proc/<pid>/cmdline and shell history. Use \
+             --owner-key-file (0600 file, or `-` for stdin) or ${OWNER_KEY_ENV} instead."
+        );
+        return Ok(Some(normalize_owner_key(&raw, "--owner-key")?));
+    }
+    Ok(None)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Keygen { dir } => {
+            // не перезаписываем существующие ключи (иначе реран генерирует новые)
+            let keys = if dir.join("keys").join("e2e.key").exists() {
+                NodeKeys::load(&dir.join("keys"))?
+            } else {
+                let k = NodeKeys::generate();
+                k.save(&dir.join("keys"))?;
+                k
+            };
+            // FULL-PQ: PQ identity is mandatory (`pq-identity.key`, 0600/0700).
+            let pq = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
+            let name = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "node".into());
+            let cfg = NodeConfig {
+                name,
+                listen: "0.0.0.0:9400".into(),
+                client_listen: None,
+                advertise: None,
+                peers: vec![],
+                allow_unknown: false,
+                unknown_allow: vec![],
+                metrics_listen: None,
+                log_level: Some(2),
+                roles: Default::default(),
+                outbox_ttl_secs: 3600,
+                storage_roles: vec![],
+                validators: vec![],
+                domain: None,
+                web_listen: None,
+                web_static: None,
+                wallet: None,
+            };
+            let cfg_path = dir.join("node.yaml");
+            if !cfg_path.exists() {
+                infnode::config::save(&cfg_path, &cfg)?;
+            }
+            println!("=== InfNode node ===");
+            println!("node_id: {}", pq.pq_id_hex());
+            println!("pq_pub : {}", pq.pq_pub_hex());
+            println!("kem_ek : {}", keys.kem_ek_hex());
+            println!("keys   : {}/keys", dir.display());
+            println!("config : {}", cfg_path.display());
+        }
+        Cmd::Init { dir, role, validator, validator_pub, listen, advertise, web_listen, domain, wallet } => {
+            // FULL-PQ: validator peer pins are PQ-only (`pq_pub` mandatory,
+            // `primary_id` derives the PQ id). `ed_pub` does not exist any
+            // more; old `node-id`/`x-pub`/`ed-pub` are refused (nodes wiped).
+            // A peer without a Falcon-512 pin cannot be added: the config
+            // parser requires `pq-pub`.
+            std::fs::create_dir_all(&dir).ok();
+            // ключи (не перезаписываем существующие)
+            let _keys = if dir.join("keys").join("e2e.key").exists() {
+                NodeKeys::load(&dir.join("keys"))?
+            } else {
+                let k = NodeKeys::generate();
+                k.save(&dir.join("keys"))?;
+                k
+            };
+            let _pq = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
+            let name = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "node".into());
+
+            // роль хранения
+            let storage_roles: Vec<String> = match role.as_deref() {
+                Some("mail") => vec!["mail".into()],
+                Some("files") => vec!["files".into()],
+                Some("both") => vec!["mail".into(), "files".into()],
+                Some("validator") => vec!["mail".into(), "files".into()],
+                _ => vec![],
+            };
+
+            // peers: валидатор (если указан). Если не указан, но задан domain (и это НЕ валидатор) —
+            // АВТОМАТИЧЕСКИ ищем валидатора в DNS TXT (федерация): нода сама находит валидатора по домену.
+            let mut peers = Vec::new();
+            if role.as_deref() != Some("validator") && validator.is_none() {
+                if let Some(dom) = &domain {
+                    println!("[federation] looking up validator of domain {dom} in DNS TXT...");
+                    match infnode::federation::resolve_validator(dom).await {
+                        Ok(Some((nid, pq_pub, ip))) => {
+                            match &pq_pub {
+                                Some(pq_hex) => {
+                                    println!("[federation] OK validator found: {nid} @ {ip} (pq_pub {})", &pq_hex[..16]);
+                                    peers.push(infnode::config::PeerConfig {
+                                        name: "validator".into(),
+                                        consensus_pub: None,
+                                        pq_pub: Some(pq_hex.clone()),
+                                        endpoints: vec![ip],
+                                        allow: vec!["*".into()],
+                                        rate_limit_per_sec: 200,
+                                        role: None,
+                                        storage_roles: vec![],
+                                    });
+                                }
+                                None => {
+                                    // PQ pin is mandatory: an unverifiable TXT is refused.
+                                    println!("[federation] ERR TXT for {dom} has no pq_pub — rejected (re-publish: infnode announce --domain {dom} --advertise <IP:port>)");
+                                }
+                            }
+                        }
+                        Ok(None) => println!("[federation] ERR TXT for {dom} not found — no validator (add a record, then: --validator ADDR or --domain again)"),
+                        Err(e) => println!("[federation] ERR DNS error: {e}"),
+                    }
+                }
+            }
+            if let Some(vaddr) = &validator {
+                // FULL-PQ: a validator peer needs its Falcon-512 `pq-pub`
+                // (identity). `--validator-pub` carries it; without a valid
+                // 897-byte key the peer is NOT added (the config parser
+                // refuses peers without `pq-pub`).
+                let vname = if role.as_deref() == Some("validator") {
+                    "self".into()
+                } else {
+                    "validator".into()
+                };
+                if vname != "self" {
+                    match validator_pub.as_deref() {
+                        Some(h)
+                            if hex::decode(h)
+                                .map(|b| b.len() == infnode::proto::PQ_FALCON_PK_LEN)
+                                .unwrap_or(false) =>
+                        {
+                            peers.push(infnode::config::PeerConfig {
+                                name: vname,
+                                consensus_pub: None,
+                                pq_pub: Some(h.to_string()),
+                                endpoints: vec![vaddr.clone()],
+                                allow: vec!["*".into()],
+                                rate_limit_per_sec: 200,
+                                role: None,
+                                storage_roles: vec![],
+                            });
+                        }
+                        _ => println!(
+                            "[init] ERR validator peer not added: --validator-pub must be a Falcon-512 pq_pub (897 bytes hex)"
+                        ),
+                    }
+                }
+            }
+
+            let advertise_final = advertise.clone().unwrap_or_else(|| listen.clone());
+            let cfg = NodeConfig {
+                name,
+                listen: listen.clone(),
+                client_listen: None,
+                advertise: Some(advertise_final.clone()),
+                peers,
+                allow_unknown: role.as_deref() == Some("validator"),
+                unknown_allow: vec!["core.ping".into(), "dht.update".into(), "dht.lookup".into(), "dht.find_node".into()],
+                metrics_listen: None,
+                log_level: Some(2),
+                roles: Default::default(),
+                outbox_ttl_secs: 3600,
+                storage_roles,
+                validators: vec![],
+                domain: domain.clone(),
+                web_listen: web_listen.clone(),
+                web_static: None,
+                wallet: wallet.clone(),
+            };
+            let cfg_path = dir.join("node.yaml");
+            infnode::config::save(&cfg_path, &cfg)?;
+
+            println!("=== InfNode node initialized ===");
+            println!("role      : {}", role.as_deref().unwrap_or("network"));
+            println!("node_id   : {}", _pq.pq_id_hex());
+            println!("pq_pub    : {}", _pq.pq_pub_hex());
+            println!("listen    : {}", listen);
+            if let Some(w) = &wallet {
+                println!("wallet    : {}", w);
+            }
+            println!("advertise : {}", advertise_final);
+            if let Some(v) = &validator {
+                println!("validator : {}", v);
+            }
+            println!("keys      : {}/keys", dir.display());
+            println!("config    : {}", cfg_path.display());
+            println!();
+            println!("Run:  {} serve --config {}", std::env::current_exe()?.display(), cfg_path.display());
+            if role.as_deref() == Some("validator") {
+                println!("VALIDATOR: set INFNODE_VALIDATOR_KEY (owner secret) and INFNODE_REWARDS=1 in env.");
+            }
+        }
+        Cmd::Serve { config, role, validator, validator_pub, domain } => {
+            // если конфиг не существует — авто-инициализация с ролью и валидатором
+            if !config.exists() {
+                let dir = config.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                std::fs::create_dir_all(&dir).ok();
+                let _keys = if dir.join("keys").join("e2e.key").exists() {
+                    NodeKeys::load(&dir.join("keys"))?
+                } else {
+                    let k = NodeKeys::generate();
+                    k.save(&dir.join("keys"))?;
+                    k
+                };
+                let _ = infnode::keyring::PqKeys::load_or_generate(&dir.join("keys"))?;
+                let name = dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "node".into());
+                let storage_roles: Vec<String> = match role.as_deref() {
+                    Some("mail") => vec!["mail".into()],
+                    Some("files") => vec!["files".into()],
+                    Some("both") => vec!["mail".into(), "files".into()],
+                    Some("validator") => vec!["mail".into(), "files".into()],
+                    _ => vec![],
+                };
+                let peers = match (&validator, validator_pub.clone().or_else(|| std::env::var("INFNODE_VALIDATOR_PUB").ok())) {
+                    (Some(vaddr), Some(pq_hex))
+                        if hex::decode(&pq_hex)
+                            .map(|b| b.len() == infnode::proto::PQ_FALCON_PK_LEN)
+                            .unwrap_or(false) =>
+                    {
+                        vec![infnode::config::PeerConfig {
+                            name: "validator".into(),
+                            consensus_pub: None,
+                            pq_pub: Some(pq_hex),
+                            endpoints: vec![vaddr.clone()],
+                            allow: vec!["*".into()],
+                            rate_limit_per_sec: 200,
+                            role: None,
+                            storage_roles: vec![],
+                        }]
+                    }
+                    (Some(_), _) => {
+                        println!("[serve] ERR validator peer not added: a Falcon-512 pq_pub (897 bytes hex) is required via --validator-pub or INFNODE_VALIDATOR_PUB");
+                        vec![]
+                    }
+                    (None, _) => vec![],
+                };
+                let cfg = NodeConfig {
+                    name,
+                    listen: "0.0.0.0:9400".into(),
+                    client_listen: None,
+                    advertise: Some("0.0.0.0:9400".into()),
+                    peers,
+                    allow_unknown: role.as_deref() == Some("validator"),
+                    unknown_allow: vec!["core.ping".into(), "dht.update".into(), "dht.lookup".into(), "dht.find_node".into()],
+                    metrics_listen: None,
+                    log_level: Some(2),
+                    roles: Default::default(),
+                    outbox_ttl_secs: 3600,
+                    storage_roles,
+                    validators: vec![],
+                    domain: domain.clone(),
+                    web_listen: None,
+                    web_static: None,
+                    wallet: None,
+                };
+                infnode::config::save(&config, &cfg)?;
+                println!("config not found — generated a new one: {}", config.display());
+            }
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            // ПОДТВЕРЖДЕНИЕ ВАЛИДАТОРА (федерация, СТРОГО): если в конфиге указан domain и это НЕ валидатор,
+            // нода ОБЯЗАНА пройти проверку TXT — иначе не запустится. Мягкий режим убран:
+            // нода не может подключиться к неподтверждённому валидатору.
+            if let Some(domain) = &cfg_obj.domain {
+                let is_validator = cfg_obj.storage_roles.len() == 2; // validator = обе роли
+                if !is_validator {
+                    // ожидаемый PQ node_id валидатора = первый peer (`primary_id`).
+                    let expected = cfg_obj
+                        .peers
+                        .first()
+                        .and_then(|p| p.primary_id().ok())
+                        .map(|id| format!("inf1:{}", hex::encode(id)));
+                    if let Some(exp_nid) = expected {
+                        println!("[federation] checking validator of domain {domain}...");
+                        match infnode::federation::verify_domain_validator(domain, &exp_nid).await {
+                            Ok(true) => println!("[federation] OK validator confirmed ({exp_nid})"),
+                            Ok(false) => {
+                                eprintln!("[federation] ERR TXT of domain {domain} does NOT confirm validator {exp_nid}");
+                                eprintln!("[federation]   Refusing to start (strict mode).");
+                                eprintln!("[federation]   Add record: infnode announce --domain {domain} --advertise <IP:port>");
+                                anyhow::bail!("validator is not confirmed by domain {domain} (strict mode)");
+                            }
+                            Err(e) => {
+                                eprintln!("[federation] ERR failed to check DNS: {e}");
+                                anyhow::bail!("failed to confirm validator of domain {domain} (strict mode)");
+                            }
+                        }
+                    }
+                }
+            }
+            let node = Node::new(cfg_obj, keys, pq, data_dir.clone(), config_path).await?;
+            if std::env::var("INFNODE_REWARDS").as_deref() == Ok("1") {
+                let node_r = node.clone();
+                let data_dir_r = data_dir.clone();
+                tokio::spawn(async move {
+                    let _ = infnode::rewards::run(&node_r, &data_dir_r).await;
+                });
+                println!("rewards tracker enabled (uptime × storage)");
+            }
+            // прогреваем узел ДО открытия API: первый запрос клиента не должен
+            // ждать сходимости меша и построения карты чанков
+            {
+                let node_w = node.clone();
+                tokio::spawn(async move {
+                    node_w.warmup().await;
+                });
+            }
+            node.serve().await?;
+        }
+        Cmd::Send {
+            config,
+            to,
+            service,
+            data,
+        } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let resp = node.request(&to, &service, data.into_bytes()).await?;
+            println!("{}", String::from_utf8_lossy(&resp));
+        }
+        Cmd::Ping { config, to, count } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            println!("{}", node.ping(&to, count).await?);
+        }
+        Cmd::Perf {
+            config,
+            to,
+            size,
+            count,
+            direction,
+        } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            println!("{}", node.perf(&to, size, count, &direction).await?);
+        }
+        Cmd::Poke { config, to } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            println!("{}", node.poke(&to).await?);
+        }
+        Cmd::PubsubPublish {
+            config,
+            to,
+            topic,
+            data,
+        } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let payload = json!({ "topic": topic, "data": data }).to_string().into_bytes();
+            let resp = node.request(&to, "pubsub.publish", payload).await?;
+            println!("{}", String::from_utf8_lossy(&resp));
+        }
+        Cmd::PubsubSubscribe {
+            config,
+            to,
+            topic,
+            timeout,
+        } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let mut rx = node.register_app_sub(&topic).await;
+            let payload = json!({ "topic": topic }).to_string().into_bytes();
+            let resp = node.request(&to, "pubsub.subscribe", payload).await?;
+            println!("{}", String::from_utf8_lossy(&resp));
+            node.start_listener(&to).await?;
+            eprintln!("[sub] waiting up to {timeout}s for topic '{topic}'...");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let mut rcvd = 0u32;
+            loop {
+                let r = tokio::time::timeout_at(deadline, rx.recv()).await;
+                match r {
+                    Ok(Some(msg)) => {
+                        rcvd += 1;
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                            println!(
+                                "[{}] #{} {} (msg_id={})",
+                                topic,
+                                rcvd,
+                                v["data"].as_str().unwrap_or(&msg),
+                                v["msg_id"].as_u64().unwrap_or(0)
+                            );
+                        } else {
+                            println!("[{topic}] #{rcvd} {msg}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        Cmd::Status { config } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            println!("{}", node.status().await?);
+        }
+        Cmd::MailRegister { config, email, dir, to: _ } => {
+            use serde_json::json;
+            let keys = infnode::mailbox::MailKeys::generate();
+            keys.save(&dir, &email)?;
+            let (cfg_obj, keys2, pq2, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys2, pq2, data_dir, config_path).await?;
+            // проверка: email уже занят? (защита от захвата чужого ящика)
+            let ukey = format!("user:{email}");
+            let h0 = blake3::hash(ukey.as_bytes());
+            let mut t0 = [0u8; 20];
+            t0.copy_from_slice(&h0.as_bytes()[..20]);
+            let c0 = node.dht_find_node(&t0).await;
+            let q0 = json!({ "key": ukey }).to_string().into_bytes();
+            let mut exists = false;
+            for n in c0.iter() {
+                if exists { break; }
+                if node.ensure_dht_peer(n).await.is_ok() {
+                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", q0.clone()).await {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                            if v["found"].as_bool().unwrap_or(false) {
+                                exists = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if exists {
+                println!("email {email} is already registered — takeover is impossible");
+                return Ok(());
+            }
+            let h = blake3::hash(ukey.as_bytes());
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&h.as_bytes()[..20]);
+            let closest = node.dht_find_node(&target).await;
+            let val = json!({ "kem_pub": keys.x_hex(), "pq_pub": keys.sig_pub_hex() }).to_string();
+            let payload = json!({ "key": ukey, "value": val }).to_string().into_bytes();
+            let mut saved = 0usize;
+            for n in closest {
+                if node.ensure_dht_peer(&n).await.is_ok()
+                    && node.request_to(n.id, "dht.store", payload.clone()).await.is_ok()
+                {
+                    saved += 1;
+                }
+            }
+            println!("registered {email} kem_pub={} (saved on {saved} nodes)", keys.x_hex());
+        }
+        Cmd::MailSend { config, to, from, dest, subject, body, dir } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            // 1) реестр: получаем x_pub получателя
+            let ukey = format!("user:{dest}");
+            let h = blake3::hash(ukey.as_bytes());
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&h.as_bytes()[..20]);
+            let closest = node.dht_find_node(&target).await;
+            let q = json!({ "key": ukey }).to_string().into_bytes();
+            let mut rx = None;
+            for n in closest.iter() {
+                if rx.is_some() { break; }
+                if node.ensure_dht_peer(n).await.is_ok() {
+                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", q.clone()).await {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                            if v["found"].as_bool().unwrap_or(false) {
+                                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(v["value"].as_str().unwrap_or("")) {
+                                    rx = meta["x_pub"].as_str().map(String::from);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let rx_hex = rx.ok_or_else(|| anyhow::anyhow!("recipient {dest} is not registered"))?;
+            let rx_bytes = hex::decode(&rx_hex).map_err(|_| anyhow::anyhow!("bad kem_pub"))?;
+            if rx_bytes.len() != infnode::mailbox::KEM_EK_LEN {
+                return Err(anyhow::anyhow!("bad kem_pub length"));
+            }
+            // 1б) реестр отправителя: pq_pub для подписи
+            let fkey = format!("user:{from}");
+            let fh = blake3::hash(fkey.as_bytes());
+            let mut ft = [0u8; 20];
+            ft.copy_from_slice(&fh.as_bytes()[..20]);
+            let fcl = node.dht_find_node(&ft).await;
+            let qf = json!({ "key": fkey }).to_string().into_bytes();
+            let mut from_pq = None;
+            for n in fcl.iter() {
+                if from_pq.is_some() { break; }
+                if node.ensure_dht_peer(n).await.is_ok() {
+                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", qf.clone()).await {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                            if v["found"].as_bool().unwrap_or(false) {
+                                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(v["value"].as_str().unwrap_or("")) {
+                                    from_pq = meta["pq_pub"].as_str().map(String::from);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _from_pq = from_pq.ok_or_else(|| anyhow::anyhow!("sender {from} is not registered"))?;
+            // 2) подписываем payload и шифруем к получателю
+            let sender_keys = infnode::mailbox::MailKeys::load(&dir, &from)?;
+            let plain = json!({ "from": from, "to": dest, "subject": subject, "body": body, "ts": infnode::proto::now_ms() })
+                .to_string()
+                .into_bytes();
+            let sig = sender_keys.sign(&plain);
+            let envelope = json!({ "payload": String::from_utf8_lossy(&plain), "sig": hex::encode(sig) })
+                .to_string()
+                .into_bytes();
+            let blob = infnode::mailbox::seal(&rx_bytes, &envelope)?;
+            let id = hex::encode(blake3::hash(format!("{from}:{dest}:{}", infnode::proto::now_ms()).as_bytes()).as_bytes());
+            // 3) храним письмо в storage (репликация)
+            let mname = format!("mail:{dest}:{id}");
+            let stored = node.store_mail(&mname, &blob).await?;
+            // 4) индекс ящика: append id
+            let ikey = format!("mail:{dest}:index");
+            let i_h = blake3::hash(ikey.as_bytes());
+            let mut it = [0u8; 20];
+            it.copy_from_slice(&i_h.as_bytes()[..20]);
+            let iclose = node.dht_find_node(&it).await;
+            let qi = json!({ "key": ikey }).to_string().into_bytes();
+            let mut idx: Vec<String> = Vec::new();
+            for n in iclose.iter() {
+                if node.ensure_dht_peer(n).await.is_ok() {
+                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", qi.clone()).await {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                            if v["found"].as_bool().unwrap_or(false) {
+                                if let Ok(list) = serde_json::from_str::<Vec<String>>(v["value"].as_str().unwrap_or("[]")) {
+                                    idx = list; break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            idx.push(id.clone());
+            let ipayload = json!({ "key": ikey, "value": serde_json::to_string(&idx)? }).to_string().into_bytes();
+            let mut idxsaved = 0usize;
+            for n in iclose {
+                if node.ensure_dht_peer(&n).await.is_ok()
+                    && node.request_to(n.id, "dht.store", ipayload.clone()).await.is_ok()
+                {
+                    idxsaved += 1;
+                }
+            }
+            // 5) уведомление через pubsub
+            let _ = node.request_to(node.resolve(&to)?, "pubsub.publish", json!({ "topic": format!("mail:{dest}"), "data": id }).to_string().into_bytes()).await;
+            println!("sent to {dest}: id={id} (stored on {stored} nodes, index on {idxsaved})");
+        }
+        Cmd::MailList { config, to, email, dir } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let ikey = format!("mail:{email}:index");
+            let h = blake3::hash(ikey.as_bytes());
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&h.as_bytes()[..20]);
+            let closest = node.dht_find_node(&target).await;
+            let q = json!({ "key": ikey }).to_string().into_bytes();
+            let mut _idx = String::from("[]");
+            let mut local = node.get_local_kv(&ikey).await;
+            if let Some(v) = local.take() { _idx = v; }
+            else {
+                for n in closest.iter() {
+                    if node.ensure_dht_peer(n).await.is_ok() {
+                        if let Ok(resp) = node.request_to(n.id, "dht.find_value", q.clone()).await {
+                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                                if v["found"].as_bool().unwrap_or(false) {
+                                    _idx = v["value"].as_str().unwrap_or("[]").to_string(); break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // владелец: подписываем запрос и спрашиваем сервис mail.list
+            let owner = match infnode::mailbox::MailKeys::load(&dir, &email) {
+                Ok(k) => k,
+                Err(_) => {
+                    println!("no key of owner {email} in {} — cannot read someone else's mailbox", dir.display());
+                    return Ok(());
+                }
+            };
+            let ts = infnode::proto::now_ms();
+            let sig = owner.sign(format!("{email}:{ts}").as_bytes());
+            let req = json!({ "email": email, "ts": ts, "sig": hex::encode(sig) }).to_string().into_bytes();
+            let mut ids = Vec::new();
+            let mut denied = false;
+            let pid = node.resolve(&to)?;
+            if let Ok(resp) = node.request_to(pid, "mail.list", req).await {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                    if v["ok"].as_bool().unwrap_or(false) {
+                        ids = v["ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                    } else {
+                        denied = true;
+                        println!("  {}", v["err"].as_str().unwrap_or("denied"));
+                    }
+                }
+            } else {
+                denied = true;
+                println!("  mail.list unavailable");
+            }
+            if !denied {
+                println!("mailbox {email}: {} messages", ids.len());
+                for id in ids { println!("  {id}"); }
+            }
+        }
+        Cmd::MailGet { config, to: _, email, id, dir } => {
+            let keys = infnode::mailbox::MailKeys::load(&dir, &email)?;
+            let (cfg_obj, node_keys, node_pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, node_keys, node_pq, data_dir, config_path).await?;
+            // скачиваем письмо из storage (через манифест)
+            let mname = format!("mail:{email}:{id}");
+            let blob = node.fetch_mail(&mname).await.ok_or_else(|| anyhow::anyhow!("mail not found"))?;
+            let plain = infnode::mailbox::open(&keys, &blob)?;
+            let env: serde_json::Value = serde_json::from_slice(&plain)?;
+            let payload = env["payload"].as_str().unwrap_or("{}").to_string();
+            let sig_hex = env["sig"].as_str().unwrap_or("");
+            let sig = hex::decode(sig_hex).unwrap_or_default();
+            let msg: serde_json::Value = serde_json::from_str(&payload)?;
+            // проверка подписи отправителя по реестру
+            let from = msg["from"].as_str().unwrap_or("");
+            let mut verified = false;
+            if sig.len() == infnode::proto::PQ_FALCON_SIG_LEN {
+                if let Some(pq_hex) = node.user_pq_pub(from).await {
+                    if let Ok(pq_pub) = hex::decode(&pq_hex) {
+                        if pq_pub.len() == infnode::proto::PQ_FALCON_PK_LEN {
+                            verified = infnode::mailbox::MailKeys::verify(
+                                &pq_pub,
+                                payload.as_bytes(),
+                                &sig,
+                            );
+                        }
+                    }
+                }
+            }
+            println!("--- message {id} (sender signature: {}) ---", if verified { "OK" } else { "NOT VERIFIED" });
+            println!("from:    {}", from);
+            println!("to:      {}", msg["to"].as_str().unwrap_or(""));
+            println!("subject: {}", msg["subject"].as_str().unwrap_or(""));
+            println!("body:    {}", msg["body"].as_str().unwrap_or(""));
+            println!("ts:      {}", msg["ts"].as_u64().unwrap_or(0));
+        }
+        Cmd::StoragePut {
+            config,
+            to: _,
+            name,
+            file,
+            bucket,
+            owner_ek,
+            owner_key_file,
+            owner_key,
+        } => {
+            let data = std::fs::read(&file)?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node_ek = keys.kem_ek_hex();
+            let node_seed = hex::encode(keys.kem_seed);
+            let owner_ek = owner_ek.unwrap_or_else(|| node_ek.clone());
+            let owner_key = match resolve_owner_key(owner_key, owner_key_file)? {
+                Some(k) => k,
+                None => {
+                    if !owner_ek.eq_ignore_ascii_case(&node_ek) {
+                        anyhow::bail!(
+                            "put refused: sealing to a foreign --owner-ek requires --owner-key \
+                             (or --owner-key-file / $INFNODE_OWNER_KEY) so the manifest can be \
+                             authenticated"
+                        );
+                    }
+                    node_seed
+                }
+            };
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            // Owner-sealed path: random data key wrapped to the owner's
+            // ML-KEM-768 ek, payload AEAD-bound to (bucket, name, H(plain)),
+            // manifest MAC'd with the owner seed. Invalid/mismatched keys fail
+            // closed (chunks == 0, no manifest written).
+            let report = node
+                .store_blob_boxed(&bucket, &name, &data, Some(&owner_ek), Some(&owner_key))
+                .await;
+            if report.chunks == 0
+                && node
+                    .get_local_kv(&Node::blob_manifest_key(&bucket, &name))
+                    .await
+                    .is_none()
+            {
+                anyhow::bail!("put refused: owner ek/seed is not a valid ML-KEM-768 key pair");
+            }
+            // One-shot CLI process: the bounded replication wait already
+            // completed inside `store_blob_boxed`; flush the manifest to
+            // kv.json and never report success for zero durable replicas.
+            node.flush_kv().await;
+            if report.replicas == 0 {
+                anyhow::bail!(
+                    "put failed: no durable replica accepted the manifest/chunks (chunks={})",
+                    report.chunks
+                );
+            }
+            println!(
+                "put ok: name={name} bytes={} chunks={} replicas={} sealed=owner (owner ek {}…)",
+                data.len(),
+                report.chunks,
+                report.replicas,
+                &owner_ek[..owner_ek.len().min(16)],
+            );
+        }
+        Cmd::StorageGet {
+            config,
+            to: _,
+            name,
+            out,
+            bucket,
+            owner_key_file,
+            owner_key,
+        } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let owner_key = resolve_owner_key(owner_key, owner_key_file)?
+                .unwrap_or_else(|| hex::encode(keys.kem_seed));
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            // Owner-aware fetch: opens an owner-sealed manifest, falls back to
+            // the legacy at-rest-obfuscation format when the blob predates
+            // sealing. Plain `fetch_blob` remains the compatibility path.
+            let plain = match node
+                .fetch_blob_owner(&bucket, &name, &owner_key)
+                .await
+            {
+                Some(p) => p,
+                None => match node.fetch_blob(&bucket, &name).await {
+                    Some(p) => p,
+                    None => {
+                        println!("blob not found or owner key refused");
+                        return Ok(());
+                    }
+                },
+            };
+            let nbytes = plain.len();
+            std::fs::write(&out, &plain)?;
+            println!("get ok: name={name} -> {} ({} bytes)", out.display(), nbytes);
+        }
+        Cmd::DhtFind { config, to: _, target } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let t = node.resolve(&target)?;
+            let nodes = node.dht_find_node(&t).await;
+            for n in nodes {
+                println!("inf1:{} {} pq={}", hex::encode(n.id), n.endpoints.join(","), n.pq_hex);
+            }
+        }
+        Cmd::DhtStore { config, to, key, value } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let _t = node.resolve(&to)?;
+            // ключ -> target = blake3(key)
+            let h = blake3::hash(key.as_bytes());
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&h.as_bytes()[..20]);
+            let closest = node.dht_find_node(&target).await;
+            let payload = json!({ "key": key, "value": value }).to_string().into_bytes();
+            let mut stored = 0usize;
+            for n in closest {
+                if node.ensure_dht_peer(&n).await.is_ok()
+                    && node.request_to(n.id, "dht.store", payload.clone()).await.is_ok()
+                {
+                    stored += 1;
+                }
+            }
+            println!("stored at {stored} nodes (k closest)");
+        }
+        Cmd::DhtGet { config, to, key } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let _t = node.resolve(&to)?;
+            let h = blake3::hash(key.as_bytes());
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&h.as_bytes()[..20]);
+            let closest = node.dht_find_node(&target).await;
+            let payload = json!({ "key": key }).to_string().into_bytes();
+            let mut found = None;
+            for n in closest {
+                if node.ensure_dht_peer(&n).await.is_ok() {
+                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", payload.clone()).await {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                            if v["found"].as_bool().unwrap_or(false) {
+                                found = v["value"].as_str().map(String::from);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            match found {
+                Some(v) => println!("value: {v}"),
+                None => println!("not found"),
+            }
+        }
+        Cmd::Find { config, to, node } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node_obj = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
+            let payload = json!({ "node": node }).to_string().into_bytes();
+            let resp = node_obj.request(&to, "dht.lookup", payload).await?;
+            println!("{}", String::from_utf8_lossy(&resp));
+        }
+        Cmd::Stats { config } => {
+            // data-dir = рядом с конфигом (по умолчанию node.yaml в текущей папке)
+            let data_dir = config
+                .as_ref()
+                .and_then(|c| c.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."));
+            // 1. kv.json
+            let kv_path = data_dir.join("kv.json");
+            let (kv_keys, kv_bytes) = match std::fs::read(&kv_path) {
+                Ok(b) => {
+                    let n = serde_json::from_slice::<serde_json::Value>(&b)
+                        .ok()
+                        .and_then(|v| v.as_object().map(|o| o.len()))
+                        .unwrap_or(0);
+                    (n, b.len())
+                }
+                Err(_) => (0, 0),
+            };
+            // 2. chunks mail/files
+            let count_chunks = |sub: &str| -> usize {
+                std::fs::read_dir(data_dir.join("chunks").join(sub))
+                    .map(|rd| rd.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0)
+            };
+            let chunks_mail = count_chunks("mail");
+            let chunks_files = count_chunks("files");
+            // 3. rewards.json
+            let rewards_nodes = std::fs::read_to_string(data_dir.join("rewards.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v["nodes"].as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            // 4. payout_ledger.json
+            let payouts_entries = std::fs::read_to_string(data_dir.join("payout_ledger.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            println!("=== InfNode stats ===");
+            println!("kv.json        : {} keys, {} bytes", kv_keys, kv_bytes);
+            println!("chunks/mail    : {}", chunks_mail);
+            println!("chunks/files   : {}", chunks_files);
+            println!("rewards.nodes  : {}", rewards_nodes);
+            println!("payouts entries: {}", payouts_entries);
+        }
+        Cmd::AuditKv { kv, find } => {
+            let path = kv.unwrap_or_else(|| PathBuf::from("kv.json"));
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+            let root: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("invalid JSON in {}: {e}", path.display()))?;
+            let Some(obj) = root.as_object() else {
+                anyhow::bail!("{} is not a JSON object", path.display());
+            };
+            if let Some(needle) = find {
+                let keys: Vec<&String> = obj.keys().filter(|k| k.contains(&needle)).collect();
+                println!("found {} keys matching '{}':", keys.len(), needle);
+                for k in keys.iter().take(50) {
+                    println!("  {k}");
+                }
+                if keys.len() > 50 {
+                    println!("  ... and {} more", keys.len() - 50);
+                }
+            } else {
+                println!("audit {}: {} keys, {} bytes", path.display(), obj.len(), raw.len());
+                let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+                for k in obj.keys() {
+                    let pref = k.split(':').next().unwrap_or(k).to_string();
+                    *counts.entry(pref).or_default() += 1;
+                }
+                for (p, c) in counts {
+                    println!("  {p:>14}: {c}");
+                }
+            }
+        }
+        Cmd::Consensus { config, hash_only } => {
+            use serde_json::json;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node = Node::new(cfg_obj.clone(), keys, pq, data_dir.clone(), config_path).await?;
+            // даём время на установление QUIC-связи с пирами (подписи шлются по установленным conn)
+            let want = cfg_obj.peers.len();
+            for _ in 0..20 {
+                if node.known_peers().await.len() >= want && node.peers_ready().await >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            // хэш состояния: kv.json (манифесты/индексы/профили) — единый снимок.
+            let state = std::fs::read_to_string(data_dir.join("kv.json")).unwrap_or_default();
+            let state_hash = hex::encode(blake3::hash(state.as_bytes()).as_bytes());
+            println!("=== Consensus (state signing) ===");
+            println!("node_id    : {}", node.id_hex);
+            println!("state_hash : {}", state_hash);
+            println!("kv.json    : {} bytes", state.len());
+            let validators = cfg_obj.validators.clone();
+            let total = validators.len() + 1; // основной + суб-валидаторы
+            let quorum = if total <= 1 { 1 } else { (total * 2).div_ceil(3) }; // ceil(2/3·N)
+            println!("validators: {} (primary + {} sub)", total, validators.len());
+            println!("quorum     : {} of {}", quorum, total);
+            if hash_only {
+                println!("hash_only  : true (signatures were not requested)");
+                return Ok(());
+            }
+            // подпись мастера (всегда своя — секрет локальный)
+            let my_sig = hex::encode(
+                node.pq
+                    .sign_digest(blake3::hash(state_hash.as_bytes()).as_bytes()),
+            );
+            let mut signatures: Vec<serde_json::Value> = vec![
+                json!({ "node_id": node.id_hex, "signature": my_sig, "who": "primary" }),
+            ];
+            // запрос подписей у суб-валидаторов (все в cfg.validators)
+            for vid in &validators {
+                // node_id → pid (raw 20 байт)
+                let raw = vid.strip_prefix("inf1:").unwrap_or(vid);
+                if let Ok(bytes) = hex::decode(raw) {
+                    if bytes.len() == 20 {
+                        let mut pid = [0u8; 20];
+                        pid.copy_from_slice(&bytes);
+                        match node.request_to(pid, "consensus.sign", json!({ "state_hash": state_hash }).to_string().into_bytes()).await {
+                            Ok(resp) => match serde_json::from_slice::<serde_json::Value>(&resp) {
+                                Ok(v) if v["ok"].as_bool().unwrap_or(false) => {
+                                    signatures.push(json!({
+                                        "node_id": v["node_id"].clone(),
+                                        "signature": v["signature"].clone(),
+                                        "who": "sub",
+                                    }));
+                                    println!("  OK signature from {}", vid);
+                                }
+                                Ok(v) => println!("  ERR {}: {}", vid, v["err"].as_str().unwrap_or("rejected")),
+                                Err(_) => println!("  ERR {}: malformed response", vid),
+                            },
+                            Err(e) => println!("  ❌ {}: {e}", vid),
+                        }
+                    }
+                }
+            }
+            let got = signatures.len();
+            let ok = got >= quorum;
+            println!("signatures : {} (need {}) -> {}", got, quorum, if ok { "OK QUORUM REACHED" } else { "ERR NO QUORUM" });
+            let rec = json!({
+                "ts": infnode::proto::now_ms(),
+                "state_hash": state_hash,
+                "validators": total,
+                "quorum": quorum,
+                "signed": got,
+                "ok": ok,
+                "signatures": signatures,
+            });
+            std::fs::write(data_dir.join("consensus.json"), serde_json::to_string_pretty(&rec)?)?;
+            println!("written   : {}/consensus.json", data_dir.display());
+        }
+        Cmd::Restore { config } => {
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let node_id = pq.pq_id_hex();
+            let node = Node::new(cfg_obj, keys, pq, data_dir.clone(), config_path).await?;
+            println!("=== Validator restore from network ===");
+            println!("node_id : {}", node_id);
+            println!("peers   : {}", node.known_peers().await.len());
+            // для каждого пира: catch_up_with (догоняющая репликация KV)
+            let peers = node.known_peers().await;
+            let mut restored = 0usize;
+            for p in peers {
+                if p.id == node.id {
+                    continue;
+                }
+                println!("  sync with {} ...", hex::encode(&p.id[..6]));
+                node.catch_up_with(p.id).await;
+                restored += 1;
+            }
+            println!("  peers synced: {}", restored);
+            println!("  KV restored from the network (manifests/indexes/account profiles).");
+            println!("  WARNING: secrets (pw_hash/smtp_pass/e2e_secret) are NOT replicated.");
+            println!("  Restore them from the validator's keys/ backup.");
+            println!("  Check kv.json: {} keys", {
+                // печатаем число ключей kv.json
+                std::fs::read_to_string(data_dir.join("kv.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.as_object().map(|o| o.len()))
+                    .unwrap_or(0)
+            });
+        }
+        Cmd::Announce { domain, advertise, config } => {
+            // Federation TXT binds the PQ identity: node_id =
+            // pq_id_from_pub(falcon_pk); `pq_pub` is published in the record.
+            let (cfg_obj, _keys, pq, _, _) = load(&config)?;
+            let node_id = pq.pq_id_hex();
+            let pq_pub = pq.pq_pub_hex();
+            let ip = advertise.split(':').next().unwrap_or(&advertise).to_string();
+            let msg = infnode::federation::announce_message(&node_id, &pq_pub, &domain, &ip);
+            println!("{}", msg);
+            println!("node_id : {}", node_id);
+            println!("pq_pub  : {}", pq_pub);
+            println!("domain  : {}", domain);
+            println!("advertise: {}", advertise);
+            let _ = cfg_obj;
+        }
+        Cmd::VerifyValidator { domain, node_id } => {
+            match infnode::federation::verify_domain_validator(&domain, &node_id).await {
+                Ok(true) => println!("OK VALIDATOR CONFIRMED: TXT of domain {domain} contains node_id {node_id}"),
+                Ok(false) => println!("ERR NOT CONFIRMED: TXT of domain {domain} does not contain node_id {node_id}\n   (add record: infnode announce --domain {domain} --advertise <IP:port>)"),
+                Err(e) => println!("WARN DNS check error: {e}"),
+            }
+        }
+    }
+    Ok(())
+}

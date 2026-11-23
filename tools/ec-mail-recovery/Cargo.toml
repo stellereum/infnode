@@ -1,0 +1,18 @@
+[package]
+name = "ec-mail-recovery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+infnode = { path = "../../crates/infnode" }
+libc = "0.2"
+reed-solomon-erasure = { version = "6.0.0", default-features = false }
+serde_json = "1"
+zeroize = "1"

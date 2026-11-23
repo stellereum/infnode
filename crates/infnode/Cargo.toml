@@ -1,0 +1,39 @@
+[package]
+name = "infnode"
+version.workspace = true
+edition.workspace = true
+description = "Инфнод: лёгковесный оверлейный P2P-протокол (QUIC + DHT + storage RF≤3 + rewards + proof-of-storage). Только сетевой слой, без почты."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+quinn = { workspace = true }
+rand = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+xsalsa20poly1305 = { workspace = true }
+aead = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+ureq = { workspace = true }
+x509-parser = { workspace = true }
+zeroize = { workspace = true }
+reed-solomon-erasure = { version = "6.0.0", default-features = false }
+ml-kem = "0.3"
+# PQ identity/frame-auth backend (Falcon-512). `falcon-rust` is the only
+# producer/verifier used by `keyring::PqKeys` and `proto::pq_falcon_*`;
+# `pqcrypto-falcon` is kept only for the chain-framing KATs.
+falcon-rust = "0.3.1"
+pqcrypto-falcon = "0.4.1"

@@ -1,0 +1,10 @@
+[Unit]
+Description=InfMail payouts generator (Go: payout drafts из ledger)
+After=network-online.target infnode.service
+Wants=infnode.service
+
+[Service]
+Type=oneshot
+User=infnode
+Environment=INFMAIL_DATA_DIR=/opt/infnode
+ExecStart=/opt/infnode/bin/infmail-payouts --last=10 --out=/opt/infnode/distribute_drafts

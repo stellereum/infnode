@@ -1,0 +1,22 @@
+[Unit]
+Description=InfMail watcher (Go: anomaly detection HTTP :9101)
+After=network-online.target infnode.service infmail-obs.service
+Wants=infnode.service
+
+[Service]
+Type=simple
+User=infnode
+Environment=INFMAIL_API_URL=http://127.0.0.1:3001
+Environment=INFMAIL_DATA_DIR=/opt/infnode
+Environment=INFMAIL_WATCHER_PORT=9101
+Environment=INFMAIL_WATCHER_LOG=/opt/infnode/alerts.log
+ExecStart=/opt/infnode/bin/infmail-watcher
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/infnode
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

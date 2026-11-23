@@ -1,0 +1,23 @@
+[Unit]
+Description=InfMail observability (Go HTTP :9100)
+After=network-online.target infnode.service
+Wants=infnode.service
+
+[Service]
+Type=simple
+User=infnode
+Environment=INFMAIL_OBS_PORT=9100
+Environment=INFMAIL_OBS_DATA_DIR=/opt/infnode
+ExecStart=/opt/infnode/bin/infmail-obs
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/infnode /var/log/infmail-obs
+PrivateTmp=true
+StandardOutput=append:/var/log/infmail-obs/obs.log
+StandardError=append:/var/log/infmail-obs/obs.log
+
+[Install]
+WantedBy=multi-user.target
